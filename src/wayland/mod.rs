@@ -80,6 +80,10 @@ pub struct State {
     pub text: crate::text::TextEngine,
     /// The left/center/right module lists.
     pub sections: crate::bar::Sections,
+    /// The notification queue (pure state; rendering arrives in Task 9).
+    pub queue: crate::notify::queue::Queue,
+    /// the D-Bus connection; None when the bus name is taken or the session bus is unreachable (degrade, do not exit).
+    pub dbus: Option<zbus::blocking::Connection>,
 }
 
 pub fn run(cfg: crate::config::Config) -> Result<(), String> {
@@ -96,6 +100,15 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
     let bar_height = cfg.bar.height as u32;
     let theme = cfg.theme.clone();
     let (sections, exec_rx) = crate::bar::Sections::from_config(&cfg);
+    let max_visible = cfg.notification.max_visible;
+    let (notif_tx, notif_rx) = calloop::channel::channel::<crate::notify::queue::Request>();
+    let dbus = match crate::notify::service::spawn(notif_tx) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("cornice: notifications unavailable: {e}");
+            None
+        }
+    };
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -114,6 +127,8 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         theme,
         text: crate::text::TextEngine::new(),
         sections,
+        queue: crate::notify::queue::Queue::new(max_visible),
+        dbus,
     };
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
@@ -123,6 +138,17 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         let calloop::channel::Event::Msg(ev) = msg else { return };
         if state.sections.update(&ev) { state.redraw_all(); }
     }).map_err(|e| format!("failed to insert the exec channel: {e}"))?;
+
+    handle.insert_source(notif_rx, |msg, _meta, state: &mut State| {
+        let calloop::channel::Event::Msg(req) = msg else { return };
+        let now = Instant::now();
+        match state.queue.apply(req, now) {
+            crate::notify::queue::Outcome::CloseRequested(id) => state.notify_closed(id, 3),
+            // Task 9 renders added/replaced notifications; this only updates the queue state
+            crate::notify::queue::Outcome::Added(_) | crate::notify::queue::Outcome::Replaced(_) => {}
+            crate::notify::queue::Outcome::Ignored => {}
+        }
+    }).map_err(|e| format!("failed to insert the notification channel: {e}"))?;
 
     // The single timer source: the callback computes the next wakeup itself and re-arms the same Timer.
     handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |now, _meta, state: &mut State| {
@@ -156,17 +182,34 @@ impl State {
         for o in outputs { self.redraw(&o); }
     }
 
-    /// Timer fired: modules decide whether a redraw is needed (clock tick).
+    /// Timer fired: modules decide whether a redraw is needed (clock tick), and expired notifications are cleaned up first.
     /// exec output goes through the channel and never passes through here.
     fn on_wake(&mut self, now: Instant) {
+        // Expire first, then compute the next wakeup: when the expiry lands in the past,
+        // e.max(now) in next_deadline returns now, and ToInstant(now) becomes a busy loop.
+        for id in self.queue.expire(now) {
+            if let Some(c) = &self.dbus {
+                let _ = crate::notify::service::emit_closed(c, id, 1);
+            }
+        }
         if self.sections.update(&crate::widget::Event::Wake(now)) {
             self.redraw_all();
         }
     }
 
-    /// The next wakeup instant. Notification expiry arrives in Task 7 and animation frames in Task 9; None for now.
+    /// The next wakeup instant. Notification expiry plugs into the third argument here; animation frames arrive in Task 9.
     fn next_deadline(&self, now: Instant) -> Instant {
-        next_deadline(now, self.animating, None)
+        next_deadline(now, self.animating, self.queue.next_expiry())
+    }
+
+    /// Close and emit NotificationClosed; ignored when the id does not exist.
+    fn notify_closed(&mut self, id: u32, reason: u32) {
+        if self.queue.remove(id).is_none() {
+            return;
+        }
+        if let Some(c) = &self.dbus {
+            let _ = crate::notify::service::emit_closed(c, id, reason);
+        }
     }
 
     fn redraw(&mut self, output: &wl_output::WlOutput) {

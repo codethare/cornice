@@ -3,6 +3,7 @@ mod bar;
 mod canvas;
 mod config;
 mod geom;
+mod notify;
 mod text;
 mod theme;
 mod wayland;
