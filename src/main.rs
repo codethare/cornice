@@ -1,3 +1,4 @@
+mod anim;
 mod bar;
 mod canvas;
 mod config;
