@@ -1,9 +1,11 @@
+mod bar;
 mod canvas;
 mod config;
 mod geom;
 mod text;
 mod theme;
 mod wayland;
+mod widget;
 
 fn main() {
     let path = config::default_path();

@@ -56,6 +56,8 @@ pub struct State {
     pub theme: crate::theme::Theme,
     /// Text layout engine; used for drawing from Task 5 on, created here to avoid changing `run`'s signature again.
     pub text: crate::text::TextEngine,
+    /// The left/center/right module lists.
+    pub sections: crate::bar::Sections,
 }
 
 pub fn run(cfg: crate::config::Config) -> Result<(), String> {
@@ -71,6 +73,7 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
 
     let bar_height = cfg.bar.height as u32;
     let theme = cfg.theme.clone();
+    let (sections, exec_rx) = crate::bar::Sections::from_config(&cfg);
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -87,11 +90,16 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         cfg,
         theme,
         text: crate::text::TextEngine::new(),
+        sections,
     };
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
     let handle = event_loop.handle();
-    WaylandSource::new(conn, event_queue).insert(handle).map_err(|e| format!("failed to insert the wayland source: {e}"))?;
+    WaylandSource::new(conn, event_queue).insert(handle.clone()).map_err(|e| format!("failed to insert the wayland source: {e}"))?;
+    handle.insert_source(exec_rx, |msg, _meta, state: &mut State| {
+        let calloop::channel::Event::Msg(ev) = msg else { return };
+        if state.sections.update(&ev) { state.redraw_all(); }
+    }).map_err(|e| format!("failed to insert the exec channel: {e}"))?;
 
     while !state.exit {
         event_loop.dispatch(None, &mut state).map_err(|e| format!("event loop error: {e}"))?;
@@ -112,16 +120,50 @@ impl State {
         let pool = SlotPool::new((self.bar_height as usize) * 4096 * 4, &self.shm).expect("failed to create the shm pool");
         self.bars.insert(output, Bar { layer, pool, width: 0, height: self.bar_height, configured: false });
     }
+
+    /// Redraw the bar on every output once.
+    pub fn redraw_all(&mut self) {
+        let outputs: Vec<_> = self.bars.keys().cloned().collect();
+        for o in outputs { self.redraw(&o); }
+    }
+
+    fn redraw(&mut self, output: &wl_output::WlOutput) {
+        let qh = self.qh.clone();
+        let theme = &self.theme;
+        let text = &mut self.text;
+        let sections = &mut self.sections;
+        if let Some(bar) = self.bars.get_mut(output) {
+            draw_bar(bar, &qh, theme, text, sections);
+        }
+    }
 }
 
-/// Fill the whole bar with a solid colour. Replaced by Canvas drawing from Task 3.
-fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, pixels: &[u8; 4]) {
+/// Draw the whole bar as the left/center/right layout.
+fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme, text: &mut crate::text::TextEngine, sections: &mut crate::bar::Sections) {
     let w = bar.width.max(1) as i32;
     let h = bar.height.max(1) as i32;
+    let widths = sections.widths(text, theme);
+    let l = crate::bar::layout(&widths, w, theme);
     let (buffer, canvas) = bar.pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).expect("failed to create the buffer");
-    // wl_shm Argb8888 is little-endian premultiplied ARGB, stored as B,G,R,A
-    for px in canvas.chunks_exact_mut(4) {
-        px.copy_from_slice(pixels);
+    let mut c = crate::canvas::Canvas::new(canvas, w, h);
+    c.clear();
+    c.fill_rounded_rect(crate::geom::Rect::new(0, 0, w, h), theme.radius, theme.background);
+    let rows = [
+        (&l.left[..], &mut sections.left[..]),
+        (&l.center[..], &mut sections.center[..]),
+        (&l.right[..], &mut sections.right[..]),
+    ];
+    for (rects, modules) in rows {
+        for (r, m) in rects.iter().zip(modules.iter_mut()) {
+            if r.is_empty() { continue; }
+            let spans = crate::bar::fit_text(&m.spans(), r.w, text, theme);
+            let mut x = r.x;
+            for s in spans {
+                let color = s.color.unwrap_or(theme.foreground);
+                text.draw(&mut c, &s.text, x, r.y + (r.h - theme.font.size as i32) / 2 - 2, &theme.font, color);
+                x += text.measure(&s.text, &theme.font).0.ceil() as i32;
+            }
+        }
     }
     bar.layer.wl_surface().damage_buffer(0, 0, w, h);
     buffer.attach_to(bar.layer.wl_surface()).expect("attach failed");
@@ -133,23 +175,24 @@ impl LayerShellHandler for State {
         self.exit = true;
     }
 
-    fn configure(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
-        // Take the background colour first, avoiding the mutable borrow of self.bars below
-        let pixels = self.theme.background.to_shm_bytes();
-        let Some((_output, bar)) = self.bars.iter_mut().find(|(_, b)| b.layer.wl_surface() == layer.wl_surface()) else {
+    fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
+        // find the output for that layer surface, then let `redraw` run layout and drawing uniformly
+        let Some(output) = self.bars.iter().find(|(_, b)| b.layer.wl_surface() == layer.wl_surface()).map(|(o, _)| o.clone()) else {
             return;
         };
-        if let Some(w) = NonZeroU32::new(configure.new_size.0) {
-            bar.width = w.get();
+        if let Some(bar) = self.bars.get_mut(&output) {
+            if let Some(w) = NonZeroU32::new(configure.new_size.0) {
+                bar.width = w.get();
+            }
+            if let Some(h) = NonZeroU32::new(configure.new_size.1) {
+                bar.height = h.get();
+            }
+            if !bar.configured {
+                bar.configured = true;
+                eprintln!("bar configured: {}x{}", bar.width, bar.height);
+            }
         }
-        if let Some(h) = NonZeroU32::new(configure.new_size.1) {
-            bar.height = h.get();
-        }
-        if !bar.configured {
-            bar.configured = true;
-            eprintln!("bar configured: {}x{}", bar.width, bar.height);
-        }
-        draw_bar(bar, qh, &pixels);
+        self.redraw(&output);
     }
 }
 
