@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::time::{Duration, Instant};
 
-use calloop::EventLoop;
+use calloop::{timer::{TimeoutAction, Timer}, EventLoop};
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -29,6 +30,25 @@ use wayland_client::{
 
 pub const LAYER_NAMESPACE: &str = "cornice";
 
+/// Animation frame interval (~60fps); used only while animating.
+pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// The clock's minimum tick resolution; the only wakeup source when idle.
+pub const CLOCK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The next instant needing a wakeup: the frame being animated, the clock tick, notification expiry — whichever comes first.
+/// Keep a single timer source that wakes once per second when idle, never spinning at 60fps.
+pub fn next_deadline(now: Instant, animating: bool, next_expiry: Option<Instant>) -> Instant {
+    let mut d = now + CLOCK_INTERVAL;
+    if animating {
+        d = d.min(now + FRAME_INTERVAL);
+    }
+    if let Some(e) = next_expiry {
+        // an already-expired time must not be returned as a past instant, or it becomes a busy wait
+        d = d.min(e.max(now));
+    }
+    d
+}
+
 pub struct Bar {
     pub layer: LayerSurface,
     pub pool: SlotPool,
@@ -52,6 +72,8 @@ pub struct State {
     pub bars: HashMap<wl_output::WlOutput, Bar>,
     pub bar_height: u32,
     pub exit: bool,
+    /// Whether an animation is running. Driven by notification enter/leave from Task 9; always false for now.
+    pub animating: bool,
     pub cfg: crate::config::Config,
     pub theme: crate::theme::Theme,
     /// Text layout engine; used for drawing from Task 5 on, created here to avoid changing `run`'s signature again.
@@ -86,6 +108,7 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         bars: HashMap::new(),
         bar_height,
         exit: false,
+        animating: false,
         conn: conn.clone(),
         cfg,
         theme,
@@ -100,6 +123,12 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         let calloop::channel::Event::Msg(ev) = msg else { return };
         if state.sections.update(&ev) { state.redraw_all(); }
     }).map_err(|e| format!("failed to insert the exec channel: {e}"))?;
+
+    // The single timer source: the callback computes the next wakeup itself and re-arms the same Timer.
+    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |now, _meta, state: &mut State| {
+        state.on_wake(now);
+        TimeoutAction::ToInstant(state.next_deadline(now))
+    }).map_err(|e| format!("failed to insert the timer: {e}"))?;
 
     while !state.exit {
         event_loop.dispatch(None, &mut state).map_err(|e| format!("event loop error: {e}"))?;
@@ -125,6 +154,19 @@ impl State {
     pub fn redraw_all(&mut self) {
         let outputs: Vec<_> = self.bars.keys().cloned().collect();
         for o in outputs { self.redraw(&o); }
+    }
+
+    /// Timer fired: modules decide whether a redraw is needed (clock tick).
+    /// exec output goes through the channel and never passes through here.
+    fn on_wake(&mut self, now: Instant) {
+        if self.sections.update(&crate::widget::Event::Wake(now)) {
+            self.redraw_all();
+        }
+    }
+
+    /// The next wakeup instant. Notification expiry arrives in Task 7 and animation frames in Task 9; None for now.
+    fn next_deadline(&self, now: Instant) -> Instant {
+        next_deadline(now, self.animating, None)
     }
 
     fn redraw(&mut self, output: &wl_output::WlOutput) {
@@ -225,7 +267,7 @@ impl PointerHandler for State {
     }
 }
 
-// This task draws no frames and needs no frame callback; animations are driven by a calloop timer (Task 6/9).
+// No frame callback is needed: redraws are driven by a calloop timer and a callback would add no extra cadence information.
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
@@ -246,3 +288,33 @@ impl ProvidesRegistryState for State {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn animating_asks_for_next_frame() {
+        let t = Instant::now();
+        assert_eq!(next_deadline(t, true, None), t + FRAME_INTERVAL);
+    }
+
+    #[test]
+    fn idle_waits_for_the_clock_tick() {
+        let t = Instant::now();
+        assert_eq!(next_deadline(t, false, None), t + CLOCK_INTERVAL);
+    }
+
+    #[test]
+    fn earliest_deadline_wins() {
+        let t = Instant::now();
+        // Expiry earlier than the next frame → use the expiry
+        let soon = t + Duration::from_millis(5);
+        assert_eq!(next_deadline(t, true, Some(soon)), soon);
+        let later = t + Duration::from_secs(30);
+        assert_eq!(next_deadline(t, true, Some(later)), t + FRAME_INTERVAL);
+        // and an expired time is never returned as a past instant either
+        assert_eq!(next_deadline(t, false, Some(t - Duration::from_secs(1))), t);
+    }
+}
