@@ -1,0 +1,7 @@
+# Architectural term: a cornice is the horizontal band at the top of a facade. Literally "the band stuck to the top edge of the screen", and its codified proportions resonate naturally.
+- Write project-style constraint text for CLAUDE.md
+
+# prompt
+ A status bar for a Linux Wayland environment, written in Rust. Its traits are simplicity, elegance and consistency, and the bar hosts a notification daemon in the same process.
+ notify-send popups appear in the top-right, morphing out of the right-hand bar component, animated like an iOS Dynamic Island.
+

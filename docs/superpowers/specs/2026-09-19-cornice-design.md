@@ -1,0 +1,244 @@
+# cornice 设计文档
+
+日期:2026-09-19
+状态:已确认,待写实施计划
+
+## 1. 目标
+
+一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。通知以"从右侧栏组件变形生长出来"的方式出现在右上角,模仿 iOS 灵动岛。
+
+首要目标是 river 窗口管理器上的可用性,但代码不包含任何 river 专有分支。
+
+### 非目标(v1 明确不做)
+
+- 图标 / 图片通知(`icon-static`、`image-path`、hicolor 主题查找、PNG 解码)
+- `body-markup` 解析,以及声音
+- DND 开关、通知历史中心
+- 点击标签切换 workspace(需要 `river-control-unstable-v1`,原语预留但依赖不引)
+- GPU 渲染、模糊/阴影过渡
+- 插件系统、脚本语言的配置、布局语言
+
+## 2. 已验证的前提
+
+- river 是**非单体**合成器:窗口管理是独立客户端,通过 `river-window-management-v1` 接入。
+- river **不向普通客户端暴露** `wlr-layer-shell-unstable-v1`。层壳客户端(mako / fuzzel / swaybg / eww …)在 river 上能工作,前提是**窗口管理器**实现了 `river-layer-shell-v1`,即由 WM 转发层壳协议。river 官方 wiki 的软件列表对这些工具逐条标注了 "require the window manager to implement the river-layer-shell-v1 protocol"。
+- 因此:cornice 是一个**普通 `wlr-layer-shell` 客户端**。在 river + kwm 上可用,在 sway/hyprland 上原生可用,不需要 river 专有代码。
+- kwm 自带的 bar 是**由 WM 自己绘制**的(走 `river-layer-shell-v1`),所以它只能作为**设计参考**,不能作为代码参考。
+
+来源:
+- <https://codeberg.org/river/wiki/raw/branch/main/pages/useful-software.md>
+- <https://wayland.app/protocols/river-layer-shell-v1>
+- <https://github.com/riverwm/river> (README:非单体架构)
+
+## 3. 架构
+
+一个进程 `cornice`,一条事件循环,三种职责。
+
+```
+calloop 主循环
+├── Wayland fd            (SCTK:registry、layer shell、shm、seat/pointer)
+├── 帧定时器              (仅动画进行中 arm,~60fps)
+├── 子进程 channel        (exec 模块 stdout 行)
+└── 定时器                (clock 等)
+        ▲
+        │ mpsc (calloop::channel)
+        │
+D-Bus 线程 (zbus, org.freedesktop.Notifications)
+```
+
+- D-Bus 在独立线程跑 zbus 的 async executor,解析完 `Notify` 后只向主循环发送一个结构体。**主循环内没有 async,状态集中在单线程**,动画与通知队列无需加锁。
+- 每个 output 拥有一套(栏 surface + 通知 surface),同进程内多实例共存。
+
+### Surface
+
+| surface | layer | anchor | 生命周期 |
+|---|---|---|---|
+| 栏 | `Top` | top + left + right | 常驻,每 output 一个,`exclusive_zone = 栏高` |
+| 通知 | `Overlay` | top + left + right,`margin_top = bar.margin` | 队列非空时创建,清空后销毁 |
+
+通知 surface 是全宽透明大块(高度 = 栏高 + 卡片区),所有卡片绘制在同一个 buffer 内。每帧调用 `set_input_region` 设为其可见形状的并集,因此透明区域对指针完全穿透。它铺在栏之上(`Overlay` > `Top`),这是"从右侧组件长出来"成立的前提:t=0 时岛的矩形与栏右簇的矩形像素重合。
+
+### 渲染栈
+
+`smithay-client-toolkit` + `wl_shm` + `cosmic-text`(内部 swash)。纯软件渲染,无 GPU。
+
+理由:本设计需要的动画是布局插值(位置/尺寸/圆角/颜色),不是特效,软件渲染可逐帧精确控制;横条 1920×32 ≈ 6 万像素、通知卡片 ≈ 5 万像素,60fps 重绘对 CPU 无压力。cosmic-text 提供文本整形与字体回退,保证中文/emoji 不出现乱码 —— 对一个中文用户日常贴顶的横条是硬需求。
+
+排除项:`wgpu/glow`(依赖与复杂度翻倍,对扁平风格无收益)、`iced/egui/gtk-layer-shell`(控件风格不可控,与"一致"目标冲突,打包体积大)。
+
+## 4. 配置
+
+位置 `$XDG_CONFIG_HOME/cornice/config.toml`,TOML + serde。解析失败时向 stderr 打印含行号的人类可读错误并退出非零 —— 不猜、不静默降级。
+
+```toml
+[bar]
+height   = 30
+margin   = 0        # 栏到屏幕边缘
+padding  = 8        # 栏内左右留白
+spacing  = 6        # 模块之间
+
+[theme]
+background = "#1a1a1aee"
+foreground = "#dcdcdc"
+accent     = "#88c0d0"
+font       = "Inter 11"
+radius     = 15     # 缺省 = height/2,即胶囊形
+
+[bar.left]
+modules = [ { kind = "river.tags" }, { kind = "river.layout" } ]
+
+[bar.center]
+modules = [ { kind = "river.title" } ]
+
+[bar.right]
+modules = [
+  { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
+  { kind = "clock", format = "%H:%M" },
+]
+
+[notification]
+max_visible = 4     # 超出者保留在队列中不绘制
+enter_ms    = 220   # 进场(岛 → 卡片)
+exit_ms     = 160   # 退场(卡片 → 岛)
+```
+
+三块各自是一个**有序模块列表**,这就是"自由搭配"的全部含义:没有嵌套容器,没有布局语言。换顺序即换顺序,关掉即删掉。
+
+**比例派生**:`radius`、卡片间距、卡片内边距缺省都由 `height` 派生,需要时再显式覆盖。默认值下,一屏配置只需写三个模块列表 —— 这是"一致"的来源。
+
+### 模块种类(v1)
+
+| kind | 数据来源 | 参数 |
+|---|---|---|
+| `clock` | 本地时间 | `format`(chrono 格式串) |
+| `exec` | 长驻子进程 stdout,一行一次更新;进程退出后 1s 重启 | `command`、`format`(含 `{out}`) |
+| `river.tags` | `river-status-unstable-v1` 推送 | 无 |
+| `river.title` | 同上 | `max_length` |
+| `river.layout` | 同上 | 无 |
+| `river.mode` | 同上 | 无 |
+
+`exec` 采用长驻流式(而非定时轮询):轮询类需求由脚本自己写循环表达(`while true; do …; sleep 5; done`),bar 端因此不需要 interval 机制与进程 spawn 调度。
+
+`river.*` 需要 vendored XML + build 期 wayland-scanner 生成绑定。这是本设计唯一引入的 river 非标准协议,也是"优先 river"的实际内容。
+
+## 5. 模块契约
+
+```rust
+struct Span {
+    text: String,
+    color: Option<Color>,
+    bg: Option<Color>,
+    action: Option<Action>,
+}
+
+trait Module {
+    fn update(&mut self, ev: Event) -> bool; // 返回是否需要重绘
+    fn spans(&self) -> Vec<Span>;
+}
+```
+
+`Span` 是唯一的 widget 原语,同时覆盖:标签高亮(`river.tags` 多段异色)、通知按钮、模块文字。栏渲染即把各模块的 spans 展平、排版、记录命中矩形。v1 只把 `action` 接到通知按钮上,标签点击留待后续 —— 原语保留,依赖不引。
+
+### 布局算法
+
+- left 靠左排,right 靠右排,center 以**屏幕中线**居中(不是以剩余空间居中)。
+- 三者重叠时 center 优先,两侧模块按需省略号截断。
+- 规则写进文档,保证可预测:不会因为标题变长而抖动。
+
+## 6. 通知子系统
+
+### D-Bus 接口
+
+- `GetCapabilities` → `["body", "actions", "persistence"]`。不声明 `body-markup` / `icon-static` / `sound`,客户端(含 `notify-send`)会自动退化为纯文本。
+- `Notify(app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout) -> id`
+- `CloseNotification(id)`
+- `GetServerInformation` → name `cornice`,spec 1.2
+- 信号:`NotificationClosed(id, reason)`、`ActionInvoked(id, action_key)`
+
+### 语义
+
+- **hints**:只认 `urgency`(0/1/2,决定配色与缺省时长);其余忽略且不报错。
+- **时长**:`expire_timeout = -1` 用缺省(low 4s / normal 6s / critical 不自动消失);`0` 永不自动消失但仍可点击关闭;`>0` 照用。
+- **`replaces_id`**:命中已有条目则就地替换内容(不重放形变),否则新建。
+- **截断**:正文超长按行数与字符数截断并加省略号。这是信任边界,必须做。
+- **队列**:按新→旧排序,`max_visible` 之外的不绘制但保留,前方消失后依次滑入;溢出丢弃最旧。
+- **关闭原因**:1 = 超时,2 = 用户关闭,3 = `CloseNotification`。
+
+### 输入
+
+左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点按钮 = `ActionInvoked` + 关闭。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
+
+### 降级
+
+若 `org.freedesktop.Notifications` 已被其他守护进程占用,栏照常运行,打印警告,仅通知功能不可用 —— 不退出。
+
+## 7. 岛屿形变
+
+单条 tween,插值对象只有五项:rect、radius、配色、文字 alpha。
+
+```
+t=0   卡片矩形 == 右簇矩形,圆角 = 栏圆角,底色 = 栏底色   → 与栏像素完全重合,视觉上"不存在"
+t=1   卡片矩形 == 右上角最终卡片位置,圆角 = 卡片圆角,底色 = 卡片底色
+```
+
+- x/y/w/h/radius/color 插值。
+- 文字立刻按最终宽度排版,但裁剪到卡片矩形内,alpha = `clamp((t - 0.35) / 0.65)`。效果即"胶囊张开成盒子,字随后浮出"。
+- 进场 220ms ease-out-cubic;退场 160ms,反向回缩到右簇。两者缺省值可在 `[notification]` 覆盖。
+- 动画期间栏 surface 完全不重绘,只有 overlay surface 在动。
+- 静止时不 arm 帧定时器,零唤醒。
+
+**关键耦合**:t=0 的矩形必须严格等于栏**右簇矩形** —— 即右区块全部模块(含模块间距)的整体矩形,外扩 `bar.padding`,y 为 `bar.margin`,高为 `bar.height`。因此栏的布局结果(`Layout` 快照)就是通知模块的输入 —— 同一份数据,不重算。
+
+**退化情况**:未配置右侧模块时,岛从栏右边缘一个点(宽 0)长起,高度取栏高。
+
+**多显示器**:通知投给当前 focus 的 output,使用该 output 的栏矩形。
+
+## 8. 文件划分
+
+```
+Cargo.toml
+build.rs                          river-status XML → wayland-scanner 绑定
+protocols/river-status-unstable-v1.xml
+src/main.rs                       装配:config → wayland → surfaces → channels
+src/config.rs                     serde schema、默认值派生、校验与错误文案
+src/theme.rs                      配色 + 由 height 派生的比例
+src/wayland/mod.rs                连接、registry、layer surface、shm 缓冲池、seat
+src/wayland/canvas.rs             圆角矩形、裁剪、合成
+src/wayland/text.rs               cosmic-text 排版与光栅化
+src/bar/mod.rs                    栏 surface、左中右布局、Layout 快照
+src/bar/modules.rs                clock / exec / river.*
+src/notify/service.rs             zbus 线程 + D-Bus 方法
+src/notify/view.rs                卡片排版 + 岛屿 tween
+src/anim.rs                       easing + Tween
+docs/smoke.md                     手动验证清单
+```
+
+## 9. 测试
+
+全部为可运行的纯逻辑测试,不引入测试框架:
+
+- **配置**:解析、缺省值派生、错误信息含行号
+- **exec**:喂行 → spans;子进程退出后重启
+- **通知状态机**:时长缺省表(-1 / 0 / urgency)、`replaces_id` 就地替换、`max_visible` 溢出、关闭原因 1/2/3、超长截断
+- **tween**:t=0 的矩形断言等于栏右簇矩形;t=1 等于终态;进度单调
+- **命中**:按钮矩形 ↔ action 映射
+
+协议层不做自动化测试(需要真实 compositor),改为 `docs/smoke.md` 中的手动清单。
+
+## 10. 里程碑
+
+每个里程碑都能单独跑起来:
+
+1. Wayland 连接 + layer-shell 栏 surface + shm + 纯色背景
+2. Canvas / 文字排版 + `clock` + 左中右布局
+3. `exec` 模块(子进程、行协议、重启)
+4. `river.*` 模块(build.rs + status 协议)
+5. 配置 schema + 校验 + 文档
+6. D-Bus 服务 + 静态卡片(无动画)
+7. 岛屿 tween + 输入(点击 / 按钮 / `max_visible`)
+
+## 11. 风险
+
+- **开发沙箱内没有可用的 river 会话。** 构建环境只能保证编译通过 + 纯逻辑测试通过;实际画面、层壳行为、动画手感必须在使用者的 kwm 会话中验证。不得声称已验证未验证的内容。
+- **`river-layer-shell-v1` 由 WM 转发**,与 wlroots 原版可能存在细节差异,尤其涉及运行时改尺寸与重排。因此里程碑 1 即最小端到端探针,让风险最先暴露。
+- 沙箱内 `XDG_RUNTIME_DIR` 缺失,任何需要真实 session bus / wayland socket 的步骤都无法在此运行。
