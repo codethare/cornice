@@ -1,0 +1,23 @@
+[package]
+name = "cornice"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Minimal Wayland status bar with a built-in notification daemon"
+license = "MIT"
+
+[dependencies]
+smithay-client-toolkit = "0.21.1"
+wayland-client = "0.31"
+calloop = "0.14"
+calloop-wayland-source = "0.4.1"
+cosmic-text = "0.19"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+chrono = "0.4"
+zbus = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
