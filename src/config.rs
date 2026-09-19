@@ -1,0 +1,234 @@
+//! TOML config: parsing, default derivation and validation errors that carry line numbers.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use toml::Spanned;
+
+use crate::geom::Color;
+use crate::theme::{parse_font, Theme};
+
+#[derive(Clone)]
+pub struct Config { pub bar: Bar, pub theme: Theme, pub notification: Notification }
+
+/// Hand-written `Debug`: the embedded `Theme` holds a `TextStyle`, which does not derive `Debug`
+/// (it belongs to Task 3's file range), the derivation comes along with it. The planned test wants `unwrap_err()`,
+/// hence `Config` must implement `Debug`.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("bar", &self.bar)
+            .field("notification", &self.notification)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Bar {
+    pub height: i32,
+    pub margin: i32,
+    pub padding: i32,
+    pub spacing: i32,
+    pub left: Vec<ModuleSpec>,
+    pub center: Vec<ModuleSpec>,
+    pub right: Vec<ModuleSpec>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ModuleSpec {
+    Clock { #[serde(default = "default_clock_format")] format: String },
+    Exec { command: String, #[serde(default)] format: String },
+}
+
+fn default_clock_format() -> String { "%H:%M".to_string() }
+
+#[derive(Clone, Debug)]
+pub struct Notification { pub max_visible: usize, pub enter_ms: u64, pub exit_ms: u64 }
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawConfig { bar: RawBar, theme: RawTheme, notification: RawNotification }
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawBar {
+    height: Option<i32>, margin: Option<i32>, padding: Option<i32>, spacing: Option<i32>,
+    left: RawSection, center: RawSection, right: RawSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawSection { modules: Vec<ModuleSpec> }
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawTheme {
+    background: Option<Spanned<String>>,
+    foreground: Option<Spanned<String>>,
+    accent: Option<Spanned<String>>,
+    font: Option<Spanned<String>>,
+    radius: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawNotification { max_visible: usize, enter_ms: u64, exit_ms: u64 }
+
+impl Default for RawNotification {
+    fn default() -> Self { Self { max_visible: 4, enter_ms: 220, exit_ms: 160 } }
+}
+
+/// Byte offset → (line, col), 1-based.
+fn line_col(text: &str, offset: usize) -> (usize, usize) {
+    let upto = &text[..offset.min(text.len())];
+    let line = upto.matches('\n').count() + 1;
+    let col = upto.rfind('\n').map_or(upto.len(), |i| upto.len() - i - 1) + 1;
+    (line, col)
+}
+
+fn color_at(text: &str, key: &str, v: &Option<Spanned<String>>, fallback: Color) -> Result<Color, String> {
+    let Some(v) = v else { return Ok(fallback) };
+    Color::from_hex(v.get_ref()).map_err(|e| {
+        let (l, c) = line_col(text, v.span().start);
+        format!("{l}:{c}: {key}: {e}")
+    })
+}
+
+pub fn parse(text: &str) -> Result<Config, String> {
+    let raw: RawConfig = toml::from_str(text).map_err(|e| format!("{e}"))?;
+
+    let height = raw.bar.height.unwrap_or(30);
+    let mut theme = Theme::defaults(height);
+    theme.padding = raw.bar.padding.unwrap_or(theme.padding);
+    theme.spacing = raw.bar.spacing.unwrap_or(theme.spacing);
+    theme.radius = raw.theme.radius.unwrap_or(theme.radius);
+    theme.background = color_at(text, "theme.background", &raw.theme.background, theme.background)?;
+    theme.foreground = color_at(text, "theme.foreground", &raw.theme.foreground, theme.foreground)?;
+    theme.accent = color_at(text, "theme.accent", &raw.theme.accent, theme.accent)?;
+    if let Some(f) = &raw.theme.font {
+        theme.font = parse_font(f.get_ref(), theme.font.size);
+    }
+
+    Ok(Config {
+        bar: Bar {
+            height,
+            margin: raw.bar.margin.unwrap_or(0),
+            padding: theme.padding,
+            spacing: theme.spacing,
+            left: raw.bar.left.modules,
+            center: raw.bar.center.modules,
+            right: raw.bar.right.modules,
+        },
+        theme,
+        notification: Notification {
+            max_visible: raw.notification.max_visible.max(1),
+            enter_ms: raw.notification.enter_ms,
+            exit_ms: raw.notification.exit_ms,
+        },
+    })
+}
+
+pub fn default_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    base.join("cornice/config.toml")
+}
+
+/// A missing file means an all-default config (the first run should not error).
+pub fn load(path: &Path) -> Result<Config, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("cornice: {} does not exist, using the default config", path.display());
+            parse("")
+        }
+        Err(e) => Err(format!("failed to read {}: {e}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r##"
+[bar]
+height = 30
+margin = 0
+padding = 8
+spacing = 6
+
+[theme]
+background = "#1a1a1aee"
+foreground = "#dcdcdc"
+font = "Inter 11"
+radius = 15
+
+[bar.left]
+modules = [ { kind = "clock", format = "%H:%M" } ]
+
+[bar.center]
+modules = []
+
+[bar.right]
+modules = [ { kind = "exec", command = "echo hi", format = "{out}!" } ]
+
+[notification]
+max_visible = 3
+"##;
+
+    #[test]
+    fn parses_sample_and_derives_defaults() {
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(c.bar.height, 30);
+        assert_eq!(c.bar.padding, 8);
+        assert_eq!(c.bar.left.len(), 1);
+        assert!(c.bar.center.is_empty());
+        assert!(matches!(c.bar.right[0], ModuleSpec::Exec { .. }));
+        assert_eq!(c.theme.radius, 15);
+        assert_eq!(c.theme.background.a, 0xee);
+        assert_eq!(c.theme.font.size, 11.0);
+        assert_eq!(c.theme.font.family, "Inter");
+        assert_eq!(c.notification.max_visible, 3);
+        assert_eq!(c.notification.enter_ms, 220, "the default when absent");
+    }
+
+    #[test]
+    fn radius_defaults_to_half_height() {
+        let c = parse("[bar]\nheight = 24\n").unwrap();
+        assert_eq!(c.theme.radius, 12);
+        assert_eq!(c.theme.card_gap, 4);
+        assert!(c.bar.left.is_empty() && c.bar.right.is_empty());
+        assert_eq!(c.bar.height, 24);
+    }
+
+    #[test]
+    fn bad_color_reports_line_number() {
+        let e = parse("[theme]\nbackground = \"zzzzzz\"\n").unwrap_err();
+        assert!(e.starts_with("2:"), "the error message should start with `line:col:`: {e}");
+        assert!(e.contains("theme.background"), "{e}");
+    }
+
+    #[test]
+    fn syntax_error_reports_line_number() {
+        let e = parse("[bar]\nheight = \n").unwrap_err();
+        assert!(e.contains("line"), "toml supplies the line number: {e}");
+    }
+
+    #[test]
+    fn unknown_module_kind_is_rejected() {
+        let e = parse("[bar.left]\nmodules = [ { kind = \"river.tags\" } ]\n").unwrap_err();
+        assert!(e.contains("river.tags") || e.contains("unknown variant"), "{e}");
+    }
+
+    #[test]
+    fn font_string_without_size_uses_default() {
+        let c = parse("[theme]\nfont = \"monospace\"\n").unwrap();
+        assert_eq!(c.theme.font.family, "monospace");
+        assert_eq!(c.theme.font.size, 11.0);
+    }
+}

@@ -28,9 +28,6 @@ use wayland_client::{
 };
 
 pub const LAYER_NAMESPACE: &str = "cornice";
-pub const BAR_HEIGHT: u32 = 30;
-/// Background colour, read from the config from Task 2.
-const PROBE_BG: [u8; 4] = [0x1a, 0x1a, 0x1a, 0xee];
 
 pub struct Bar {
     pub layer: LayerSurface,
@@ -55,9 +52,13 @@ pub struct State {
     pub bars: HashMap<wl_output::WlOutput, Bar>,
     pub bar_height: u32,
     pub exit: bool,
+    pub cfg: crate::config::Config,
+    pub theme: crate::theme::Theme,
+    /// Text layout engine; used for drawing from Task 5 on, created here to avoid changing `run`'s signature again.
+    pub text: crate::text::TextEngine,
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(cfg: crate::config::Config) -> Result<(), String> {
     let conn = Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(|e| format!("failed to read globals: {e}"))?;
     let qh = event_queue.handle();
@@ -68,6 +69,8 @@ pub fn run() -> Result<(), String> {
     })?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("missing wl_shm: {e}"))?;
 
+    let bar_height = cfg.bar.height as u32;
+    let theme = cfg.theme.clone();
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -78,9 +81,12 @@ pub fn run() -> Result<(), String> {
         qh: qh.clone(),
         pointer: None,
         bars: HashMap::new(),
-        bar_height: BAR_HEIGHT,
-        conn: conn.clone(),
+        bar_height,
         exit: false,
+        conn: conn.clone(),
+        cfg,
+        theme,
+        text: crate::text::TextEngine::new(),
     };
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
@@ -128,7 +134,8 @@ impl LayerShellHandler for State {
     }
 
     fn configure(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
-        let qh = qh.clone();
+        // Take the background colour first, avoiding the mutable borrow of self.bars below
+        let pixels = self.theme.background.to_shm_bytes();
         let Some((_output, bar)) = self.bars.iter_mut().find(|(_, b)| b.layer.wl_surface() == layer.wl_surface()) else {
             return;
         };
@@ -142,7 +149,7 @@ impl LayerShellHandler for State {
             bar.configured = true;
             eprintln!("bar configured: {}x{}", bar.width, bar.height);
         }
-        draw_bar(bar, &qh, &PROBE_BG);
+        draw_bar(bar, qh, &pixels);
     }
 }
 
