@@ -30,6 +30,10 @@ pub enum Outcome { Added(u32), Replaced(u32), CloseRequested(u32), Ignored }
 pub const MAX_BODY_LINES: usize = 5;
 pub const MAX_BODY_CHARS: usize = 300;
 
+/// Queue capacity multiplier: capacity = `max_visible * QUEUE_CAP_MULTIPLIER`.
+/// Derived from existing parameters like every other ratio; no new config key.
+const QUEUE_CAP_MULTIPLIER: usize = 4;
+
 pub fn default_timeout(u: Urgency) -> Option<Duration> {
     match u {
         Urgency::Low => Some(Duration::from_secs(4)),
@@ -55,10 +59,15 @@ pub struct Queue {
     /// new → old
     items: Vec<Notification>,
     max_visible: usize,
+    /// Total queue capacity; on overflow the oldest is dropped (see `apply`).
+    max_queued: usize,
 }
 
 impl Queue {
-    pub fn new(max_visible: usize) -> Self { Self { items: Vec::new(), max_visible: max_visible.max(1) } }
+    pub fn new(max_visible: usize) -> Self {
+        let max_visible = max_visible.max(1);
+        Self { items: Vec::new(), max_visible, max_queued: max_visible * QUEUE_CAP_MULTIPLIER }
+    }
 
     pub fn visible(&self) -> &[Notification] { &self.items[..self.items.len().min(self.max_visible)] }
     pub fn get(&self, id: u32) -> Option<&Notification> { self.items.iter().find(|n| n.id == id) }
@@ -82,6 +91,11 @@ impl Queue {
                     }
                 }
                 self.items.insert(0, updated);
+                // ponytail: the cap only stops "unbounded growth from a flooding client" (trust boundary),
+                // the oldest dropped entry emits no NotificationClosed — the design doc does not require a signal on overflow,
+                // and only a flooding client can reach this branch. If a client ever relies on a close signal on overflow,
+                // add an Outcome variant carrying the dropped id instead of emitting a signal here.
+                self.items.truncate(self.max_queued);
                 Outcome::Added(id)
             }
             Request::Close { id } => {
@@ -197,6 +211,37 @@ mod tests {
         q.remove(1);
         // new → old order: notify(3) is newest at the head, notify(2) next; the one dropped is the hidden id=1 at the tail
         assert_eq!(q.visible().iter().map(|n| n.id).collect::<Vec<_>>(), vec![3, 2], "they slide in in turn as earlier ones disappear");
+    }
+
+    #[test]
+    fn overflow_drops_the_oldest() {
+        let now = Instant::now();
+        // max_visible = 2 → capacity = 2 * 4 = 8
+        let mut q = Queue::new(2);
+        for id in 1..=10 {
+            q.apply(notify(id, 0), now);
+        }
+        // keep only the newest 8: the two oldest are dropped
+        assert!(q.get(1).is_none(), "the oldest entry should be dropped");
+        assert!(q.get(2).is_none(), "the second oldest entry should be dropped");
+        for id in 3..=10 {
+            assert!(q.get(id).is_some(), "id={id} should still be queued");
+        }
+        // the visible window is still max_visible and runs new → old
+        assert_eq!(q.visible().iter().map(|n| n.id).collect::<Vec<_>>(), vec![10, 9]);
+    }
+
+    #[test]
+    fn below_cap_keeps_everything() {
+        let now = Instant::now();
+        let mut q = Queue::new(2);
+        for id in 1..=8 {
+            q.apply(notify(id, 0), now);
+        }
+        assert_eq!(q.visible().iter().map(|n| n.id).collect::<Vec<_>>(), vec![8, 7]);
+        for id in 1..=8 {
+            assert!(q.get(id).is_some(), "id={id} is within capacity and must not be dropped");
+        }
     }
 
     #[test]
