@@ -54,7 +54,9 @@ struct RawConfig { bar: RawBar, theme: RawTheme, notification: RawNotification }
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawBar {
-    height: Option<i32>, margin: Option<i32>, padding: Option<i32>, spacing: Option<i32>,
+    /// `Spanned` exists so an out-of-range error points at the real line and column.
+    height: Option<Spanned<i32>>,
+    margin: Option<i32>, padding: Option<i32>, spacing: Option<i32>,
     left: RawSection, center: RawSection, right: RawSection,
 }
 
@@ -96,10 +98,27 @@ fn color_at(text: &str, key: &str, v: &Option<Spanned<String>>, fallback: Color)
     })
 }
 
+const DEFAULT_HEIGHT: i32 = 30;
+/// Valid bar height range in pixels. The upper bound is defensive: the value is also `layer.set_size`,
+/// input to each output's `SlotPool::new(width * height * 4)` and to the derived ratios (radius / padding),
+/// a mistyped number must not turn into a multi-terabyte allocation request.
+const HEIGHT_RANGE: std::ops::RangeInclusive<i32> = 1..=HEIGHT_MAX;
+const HEIGHT_MAX: i32 = 256;
+
+fn height_at(text: &str, v: &Option<Spanned<i32>>) -> Result<i32, String> {
+    let Some(v) = v else { return Ok(DEFAULT_HEIGHT) };
+    let h = *v.get_ref();
+    if !HEIGHT_RANGE.contains(&h) {
+        let (l, c) = line_col(text, v.span().start);
+        return Err(format!("{l}:{c}: bar.height: bar height must be within {HEIGHT_RANGE:?} pixels, currently {h}"));
+    }
+    Ok(h)
+}
+
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("{e}"))?;
 
-    let height = raw.bar.height.unwrap_or(30);
+    let height = height_at(text, &raw.bar.height)?;
     let mut theme = Theme::defaults(height);
     theme.padding = raw.bar.padding.unwrap_or(theme.padding);
     theme.spacing = raw.bar.spacing.unwrap_or(theme.spacing);
@@ -230,5 +249,30 @@ max_visible = 3
         let c = parse("[theme]\nfont = \"monospace\"\n").unwrap();
         assert_eq!(c.theme.font.family, "monospace");
         assert_eq!(c.theme.font.size, 11.0);
+    }
+
+    /// Trust boundary: height flows into `layer.set_size` and the shm pool size, so it must be rejected at the parsing layer.
+    #[test]
+    fn out_of_range_height_is_rejected_with_line_and_column() {
+        for (input, shown) in [
+            ("[bar]\nheight = -1\n", "-1"),
+            ("[bar]\nheight = 0\n", "0"),
+            ("[bar]\nheight = 4096\n", "4096"),
+        ] {
+            let e = parse(input).unwrap_err();
+            assert!(e.starts_with("2:"), "the error message should start with `line:col:`: {e}");
+            assert!(e.contains("bar.height"), "{e}");
+            assert!(e.contains(shown), "{e}");
+        }
+    }
+
+    #[test]
+    fn height_range_edges_are_accepted() {
+        for h in [1, 24, 30, 40, 256] {
+            let input = format!("[bar]\nheight = {h}\n");
+            assert_eq!(parse(&input).unwrap().bar.height, h);
+        }
+        // still defaults to 30 when the key is absent
+        assert_eq!(parse("[bar]\n").unwrap().bar.height, 30);
     }
 }
