@@ -1,4 +1,6 @@
+mod canvas;
 mod geom;
+mod text;
 mod wayland;
 
 fn main() {
