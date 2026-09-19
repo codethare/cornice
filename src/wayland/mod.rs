@@ -250,12 +250,13 @@ impl State {
                 let _ = crate::notify::service::emit_closed(c, id, 1);
             }
         }
-        // While animating, step at a 16ms cadence; once done, redraw_notifications clears animating.
-        if self.animating {
-            self.redraw_notifications(now);
-        }
+        // Refresh the clock/bar layout first: the enter animation's island origin must follow the latest right cluster (the clock ticking moves it).
         if self.sections.update(&crate::widget::Event::Wake(now)) {
             self.redraw_all();
+        }
+        // Then draw notifications: while animating, step at a 16ms cadence; once done, redraw_notifications clears animating.
+        if self.animating {
+            self.redraw_notifications(now);
         }
     }
 
@@ -412,6 +413,13 @@ impl State {
 
         // 4. Geometry (independent of whether the surface is configured; uses the bar width).
         let (island, rects) = self.notif_geometry(output_w);
+        // The enter animation's origin must follow the latest bar layout (the clock ticking / a bar width change moves the right cluster).
+        // A leave animation's start is the slot at the moment of closing and must not drift with re-layout, so only Enter is changed here.
+        if let Some(anim) = self.anim.as_mut() {
+            if matches!(&anim.kind, AnimKind::Enter(_)) {
+                anim.start = island;
+            }
+        }
         let visible = self.queue.visible();
 
         // 5. Draw.
@@ -530,14 +538,21 @@ impl LayerShellHandler for State {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
         // The compositor closing the notification surface (e.g. its output was removed) ≠ process exit.
         if self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
+            // The compositor closed the notification surface (usually because its output was removed).
+            // Clear the state before redrawing: ensure_notif_surface falls back to a remaining output when the queue is non-empty,
+            // otherwise a resident notification with expire=None would stay invisible forever.
             self.notif = None;
             self.hits.clear();
             self.set_anim(None);
             self.notif_output = None;
+            self.redraw_notifications(Instant::now());
             return;
         }
-        // Bar closed: keep the existing behaviour (multi-output hot-unplug exit is left to the final review).
-        self.exit = true;
+        // Bar closed → process exit. Only exit when it really matches a bar: when an output is removed we have already
+        // output_destroyed tears down the notification surface itself; a stale closed arriving afterwards belongs to no bar and is ignored.
+        if self.bars.values().any(|b| b.layer.wl_surface() == layer.wl_surface()) {
+            self.exit = true;
+        }
     }
 
     fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
@@ -585,9 +600,14 @@ impl OutputHandler for State {
     fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.bars.remove(&output);
-        // The notification surface's output is gone: the compositor's closed event clears the surface; this only clears the choice.
+        // The notification surface's output is gone: do not depend on the order of closed events — tear it down and fall back to
+        // The remaining output. Clear state before redrawing — redraw_notifications is a no-op when the queue is empty.
         if self.notif_output.as_ref() == Some(&output) {
+            self.notif = None;
+            self.hits.clear();
+            self.set_anim(None);
             self.notif_output = None;
+            self.redraw_notifications(Instant::now());
         }
     }
 }
