@@ -28,8 +28,6 @@ impl fmt::Debug for Config {
 pub struct Bar {
     pub height: i32,
     pub margin: i32,
-    pub padding: i32,
-    pub spacing: i32,
     pub left: Vec<ModuleSpec>,
     pub center: Vec<ModuleSpec>,
     pub right: Vec<ModuleSpec>,
@@ -134,8 +132,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
         bar: Bar {
             height,
             margin: raw.bar.margin.unwrap_or(0),
-            padding: theme.padding,
-            spacing: theme.spacing,
             left: raw.bar.left.modules,
             center: raw.bar.center.modules,
             right: raw.bar.right.modules,
@@ -204,7 +200,8 @@ max_visible = 3
     fn parses_sample_and_derives_defaults() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(c.bar.height, 30);
-        assert_eq!(c.bar.padding, 8);
+        assert_eq!(c.theme.padding, 8);
+        assert_eq!(c.theme.spacing, 6);
         assert_eq!(c.bar.left.len(), 1);
         assert!(c.bar.center.is_empty());
         assert!(matches!(c.bar.right[0], ModuleSpec::Exec { .. }));

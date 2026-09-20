@@ -33,6 +33,8 @@ impl NotifyDaemon {
         hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
+        // app_name is the fixed first argument of the freedesktop contract, but this implementation never shows the source app name: it accepts it and stores nothing.
+        let _ = app_name;
         let id = if replaces_id != 0 { replaces_id } else { self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
         let urgency = match hints.get("urgency").and_then(|v| u8::try_from(v.clone()).ok()) {
             Some(0) => Urgency::Low,
@@ -40,7 +42,7 @@ impl NotifyDaemon {
             _ => Urgency::Normal,
         };
         let actions = actions.chunks(2).filter_map(|c| Some((c.first()?.clone(), c.get(1)?.clone()))).collect();
-        let _ = self.tx.send(Request::Notify { id, app_name, replaces_id, summary, body, actions, urgency, expire_timeout });
+        let _ = self.tx.send(Request::Notify { id, replaces_id, summary, body, actions, urgency, expire_timeout });
         id
     }
 

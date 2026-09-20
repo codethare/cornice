@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use calloop::{timer::{TimeoutAction, Timer}, EventLoop};
+use calloop::{timer::{TimeoutAction, Timer}, EventLoop, LoopHandle, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
@@ -88,9 +88,6 @@ struct Anim {
 }
 
 pub struct State {
-    /// A copy of the connection for later tasks; this probe does not read it yet.
-    #[allow(dead_code)]
-    pub conn: Connection,
     pub qh: QueueHandle<State>,
     pub registry: RegistryState,
     pub seat_state: SeatState,
@@ -102,7 +99,7 @@ pub struct State {
     pub bars: HashMap<wl_output::WlOutput, Bar>,
     pub bar_height: u32,
     pub exit: bool,
-    /// Whether an animation is running. Driven by notification enter/leave from Task 9; always false for now.
+    /// Whether an enter/leave animation is running; maintained by `set_anim` and driving the frame source at ~16ms.
     pub animating: bool,
     pub cfg: crate::config::Config,
     pub theme: crate::theme::Theme,
@@ -122,6 +119,11 @@ pub struct State {
     anim: Option<Anim>,
     /// The output the notification surface hangs on (the first output that has a bar).
     notif_output: Option<wl_output::WlOutput>,
+    /// Registration handle for the frame source: inserted while animating, set to None after it self-Drops when idle.
+    frame_id: Option<RegistrationToken>,
+    /// Event-loop handle so `set_anim` can insert the frame source from any callback.
+    /// `'static` because `State` itself is `'static` (no field borrows a local scope).
+    loop_handle: LoopHandle<'static, State>,
 }
 
 pub fn run(cfg: crate::config::Config) -> Result<(), String> {
@@ -147,6 +149,9 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
             None
         }
     };
+    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
+    let handle = event_loop.handle();
+
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -160,7 +165,6 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         bar_height,
         exit: false,
         animating: false,
-        conn: conn.clone(),
         cfg,
         theme,
         text: crate::text::TextEngine::new(),
@@ -171,10 +175,9 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         hits: Vec::new(),
         anim: None,
         notif_output: None,
+        frame_id: None,
+        loop_handle: handle.clone(),
     };
-
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
-    let handle = event_loop.handle();
     WaylandSource::new(conn, event_queue).insert(handle.clone()).map_err(|e| format!("failed to insert the wayland source: {e}"))?;
     handle.insert_source(exec_rx, |msg, _meta, state: &mut State| {
         let calloop::channel::Event::Msg(ev) = msg else { return };
@@ -199,10 +202,11 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         }
     }).map_err(|e| format!("failed to insert the notification channel: {e}"))?;
 
-    // The single timer source: the callback computes the next wakeup itself and re-arms the same Timer.
+    // Idle timer: handles the per-second clock tick and notification expiry only; animation frames come from a separate frame source (see ensure_frame_source).
+    // so animating is passed as a fixed false here — otherwise it would form two 16ms sources with the frame source during animation.
     handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |now, _meta, state: &mut State| {
         state.on_wake(now);
-        TimeoutAction::ToInstant(state.next_deadline(now))
+        TimeoutAction::ToInstant(next_deadline(now, false, state.queue.next_expiry()))
     }).map_err(|e| format!("failed to insert the timer: {e}"))?;
 
     while !state.exit {
@@ -217,7 +221,11 @@ impl State {
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some(LAYER_NAMESPACE), Some(&output));
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(self.bar_height as i32);
+        // The margin is vertical only (top): this keeps the horizontal coordinate systems of the bar and notification surface identical (both span the full width),
+        // the island's t=0 "aligned to the right cluster pixel" only holds then; a horizontal inset would break that premise, so it is deliberately unsupported.
+        layer.set_margin(self.cfg.bar.margin, 0, 0, 0);
+        // Design §3: exclusive_zone = bar height + 2×margin (a margin above and below).
+        layer.set_exclusive_zone(self.bar_height as i32 + 2 * self.cfg.bar.margin);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, self.bar_height); // width 0 + both horizontal anchors = the compositor gives full width
         layer.commit();
@@ -251,7 +259,7 @@ impl State {
             }
         }
         // Refresh the clock/bar layout first: the enter animation's island origin must follow the latest right cluster (the clock ticking moves it).
-        if self.sections.update(&crate::widget::Event::Wake(now)) {
+        if self.sections.update(&crate::widget::Event::Wake) {
             self.redraw_all();
         }
         // Then draw notifications: while animating, step at a 16ms cadence; once done, redraw_notifications clears animating.
@@ -260,16 +268,40 @@ impl State {
         }
     }
 
-    /// The next wakeup instant. Notification expiry plugs into the third argument here; animation frames arrive in Task 9.
-    fn next_deadline(&self, now: Instant) -> Instant {
-        next_deadline(now, self.animating, self.queue.next_expiry())
-    }
-
     /// Set/clear the animation and maintain `animating` in the same change, otherwise
     /// Leaving `animating` true would spin the timer at 16ms forever (ruling #9).
     fn set_anim(&mut self, anim: Option<Anim>) {
         self.animating = anim.is_some();
         self.anim = anim;
+        if self.animating {
+            self.ensure_frame_source();
+        }
+    }
+
+    /// Frame source: drives `on_wake` at ~16ms while animating; when idle the callback does its own `TimeoutAction::Drop`.
+    /// Make sure it exists whenever `animating` flips from false to true — whichever callback starts the animation
+    /// (notification channel, pointer clicks, expiry cleanup). Otherwise the single idle timer may sleep for up to 1s before waking,
+    /// while enter/leave lasts only 160~220ms, so the tween has long finished and the card jumps (final review Critical #1).
+    fn ensure_frame_source(&mut self) {
+        if self.frame_id.is_some() || !self.animating {
+            return;
+        }
+        let token = self.loop_handle.insert_source(
+            Timer::from_duration(FRAME_INTERVAL),
+            |now, _meta, state: &mut State| {
+                state.on_wake(now);
+                if state.animating {
+                    TimeoutAction::ToInstant(now + FRAME_INTERVAL)
+                } else {
+                    // Animation finished: clear the registration; the source removes itself after the callback returns (TimeoutAction::Drop → PostAction::Remove).
+                    state.frame_id = None;
+                    TimeoutAction::Drop
+                }
+            },
+        );
+        if let Ok(token) = token {
+            self.frame_id = Some(token);
+        }
     }
 
     /// The bar width (full width) of the output the notification surface should target.
@@ -284,7 +316,10 @@ impl State {
     /// Notification surface height: the gap below the bar plus max_visible cards (each estimated at up to 3 lines of text).
     fn notif_surface_height(&self) -> u32 {
         let line = (self.theme.font.size * 1.35).ceil() as i32;
-        let per_card = self.theme.card_padding * 2 + line * 3 + self.theme.card_gap;
+        // Worst-case height per card: summary 1 line + body up to MAX_BODY_LINES lines + actions 1 line.
+        // must be ≥ the true upper bound of card_size, or the bottom-most card gets clipped.
+        let lines_per_card = 1 + crate::notify::queue::MAX_BODY_LINES as i32 + 1;
+        let per_card = self.theme.card_padding * 2 + line * lines_per_card + self.theme.card_gap;
         let n = self.cfg.notification.max_visible as i32;
         let h = self.cfg.bar.margin
             + self.cfg.bar.height
@@ -504,6 +539,12 @@ impl State {
 
 /// Draw the whole bar as the left/center/right layout.
 fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme, text: &mut crate::text::TextEngine, sections: &mut crate::bar::Sections) {
+    // No buffer may be attached before the first configure: wlroots treats "a buffer before configure" as a protocol error
+    // (final review Critical #3). The configure callback sets configured = true before reaching here, so this
+    // only stops paths like "the exec module emits before configure → redraw_all".
+    if !bar.configured {
+        return;
+    }
     let w = bar.width.max(1) as i32;
     let h = bar.height.max(1) as i32;
     let widths = sections.widths(text, theme);
@@ -591,6 +632,9 @@ impl LayerShellHandler for State {
             }
         }
         self.redraw(&output);
+        // A notification may arrive before the first output configures (ensure_notif_surface was a no-op then).
+        // One catch-up pass once the bar appears: no-op on an empty queue, otherwise create/draw the surface (final review Important #3).
+        self.redraw_notifications(Instant::now());
     }
 }
 

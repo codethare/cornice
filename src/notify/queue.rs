@@ -8,7 +8,6 @@ pub enum Urgency { Low, Normal, Critical }
 #[derive(Clone, Debug)]
 pub struct Notification {
     pub id: u32,
-    pub app_name: String,
     pub summary: String,
     pub body: String,
     pub urgency: Urgency,
@@ -20,7 +19,7 @@ pub struct Notification {
 
 #[derive(Clone, Debug)]
 pub enum Request {
-    Notify { id: u32, app_name: String, replaces_id: u32, summary: String, body: String, actions: Vec<(String, String)>, urgency: Urgency, expire_timeout: i32 },
+    Notify { id: u32, replaces_id: u32, summary: String, body: String, actions: Vec<(String, String)>, urgency: Urgency, expire_timeout: i32 },
     Close { id: u32 },
 }
 
@@ -66,7 +65,7 @@ pub struct Queue {
 impl Queue {
     pub fn new(max_visible: usize) -> Self {
         let max_visible = max_visible.max(1);
-        Self { items: Vec::new(), max_visible, max_queued: max_visible * QUEUE_CAP_MULTIPLIER }
+        Self { items: Vec::new(), max_visible, max_queued: max_visible.saturating_mul(QUEUE_CAP_MULTIPLIER) }
     }
 
     pub fn visible(&self) -> &[Notification] { &self.items[..self.items.len().min(self.max_visible)] }
@@ -80,9 +79,9 @@ impl Queue {
 
     pub fn apply(&mut self, req: Request, now: Instant) -> Outcome {
         match req {
-            Request::Notify { id, app_name, replaces_id, summary, body, actions, urgency, expire_timeout } => {
+            Request::Notify { id, replaces_id, summary, body, actions, urgency, expire_timeout } => {
                 let expire = if expire_timeout < 0 { default_timeout(urgency) } else if expire_timeout == 0 { None } else { Some(Duration::from_millis(expire_timeout as u64)) };
-                let updated = Notification { id, app_name, summary, body: truncate_body(&body), urgency, expire, actions, created: now };
+                let updated = Notification { id, summary, body: truncate_body(&body), urgency, expire, actions, created: now };
                 if replaces_id != 0 {
                     if let Some(slot) = self.items.iter_mut().find(|n| n.id == replaces_id) {
                         let kept_id = slot.id;
@@ -99,8 +98,8 @@ impl Queue {
                 Outcome::Added(id)
             }
             Request::Close { id } => {
-                // report presence only and let notify_closed remove it once; otherwise it is removed twice,
-                // a second remove in notify_closed returns None and swallows the NotificationClosed signal.
+                // report presence only and let close_visible remove it once; otherwise it is removed twice,
+                // a second remove in close_visible returns None and swallows the NotificationClosed signal.
                 if self.get(id).is_some() { Outcome::CloseRequested(id) } else { Outcome::Ignored }
             }
         }
@@ -131,7 +130,6 @@ mod tests {
     fn notify(id: u32, replaces: u32) -> Request {
         Request::Notify {
             id,
-            app_name: "test".into(),
             replaces_id: replaces,
             summary: format!("s{id}"),
             body: "b".into(),
@@ -151,8 +149,8 @@ mod tests {
     /// Same as `notify`, but with an explicit `expire_timeout`.
     fn notify_t(id: u32, replaces: u32, expire_timeout: i32) -> Request {
         match notify(id, replaces) {
-            Request::Notify { id, app_name, replaces_id, summary, body, actions, urgency, .. } =>
-                Request::Notify { id, app_name, replaces_id, summary, body, actions, urgency, expire_timeout },
+            Request::Notify { id, replaces_id, summary, body, actions, urgency, .. } =>
+                Request::Notify { id, replaces_id, summary, body, actions, urgency, expire_timeout },
             _ => unreachable!(),
         }
     }

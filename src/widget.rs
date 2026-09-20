@@ -1,7 +1,5 @@
 //! Minimal widget primitives shared by the bar and notifications.
 
-use std::time::Instant;
-
 use crate::geom::Color;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -22,14 +20,19 @@ impl Span {
     pub fn text(text: impl Into<String>) -> Self {
         Self { text: text.into(), ..Default::default() }
     }
+    // Design §5 says the Span primitive covers "multi-colour text runs, notification buttons and module text" at once.
+    // v1 notification buttons build `Action` directly and bypass Span, so these two constructors have no production caller yet;
+    // the primitives are kept by design, so they are allowed deliberately — the only dead-code exemption in the tree; all other dead code is deleted.
+    #[allow(dead_code)]
     pub fn with_color(mut self, c: Color) -> Self { self.color = Some(c); self }
+    #[allow(dead_code)]
     pub fn with_action(mut self, a: Action) -> Self { self.action = Some(a); self }
 }
 
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Timer wakeup (clock tick, animation step)
-    Wake(Instant),
+    Wake,
     /// One line of output from the `id`-th exec module child
     Line { id: usize, text: String },
 }

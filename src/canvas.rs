@@ -8,11 +8,12 @@ pub struct Canvas<'a> {
     data: &'a mut [u8],
     width: i32,
     height: i32,
+    clip: Option<Rect>,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(data: &'a mut [u8], width: i32, height: i32) -> Self {
-        Self { data, width, height }
+        Self { data, width, height, clip: None }
     }
 
     /// Transparent pixels the surface does not cover must be cleared explicitly, or shm keeps the previous frame's leftovers.
@@ -20,9 +21,20 @@ impl<'a> Canvas<'a> {
         self.data.fill(0);
     }
 
+    /// Set the clip rect; `None` means no clipping.
+    /// While a notification card enters, the rect is smaller than the laid-out text, so text pixels are clipped to the card rect (design §7).
+    pub fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
+    }
+
     fn blend_px(&mut self, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return;
+        }
+        if let Some(c) = self.clip {
+            if !c.contains(x, y) {
+                return;
+            }
         }
         let i = ((y * self.width + x) * 4) as usize;
         let src = color.to_shm_bytes();

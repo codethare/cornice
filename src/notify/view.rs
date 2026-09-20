@@ -23,10 +23,10 @@ pub fn card_size(n: &Notification, text: &mut TextEngine, theme: &Theme) -> (i32
     let (bw, _) = text.measure(&n.body, &theme.font);
     let line = (theme.font.size * 1.35).ceil() as i32;
     let w = (sw.max(bw).ceil() as i32 + theme.card_padding * 2).clamp(80, MAX_CARD_W);
-    let mut h = theme.card_padding * 2 + line;
-    if !n.body.is_empty() {
-        h += line;
-    }
+    // body was already truncated to MAX_BODY_LINES by the queue, but a directly constructed Notification (tests) may have more;
+    // the height is counted from the real line count, or a multi-line body spills onto the next card (final review Critical #2a).
+    let body_lines = if n.body.is_empty() { 0 } else { n.body.lines().count().clamp(1, crate::notify::queue::MAX_BODY_LINES) };
+    let mut h = theme.card_padding * 2 + line * (1 + body_lines as i32);
     if !n.actions.is_empty() {
         h += line + theme.card_gap;
     }
@@ -56,26 +56,37 @@ pub fn render(canvas: &mut Canvas, rect: Rect, radius: i32, alpha: f32, n: &Noti
     let fa = |c: Color| Color::rgba(c.r, c.g, c.b, (c.a as f32 * alpha.clamp(0.0, 1.0)) as u8);
     let line = (theme.font.size * 1.35).ceil() as i32;
     let x = rect.x + theme.card_padding;
+    // inner width: all text is truncated to the card; summary is untrusted D-Bus input and must be truncated (final review Critical #2b).
+    let inner_w = (rect.w - theme.card_padding * 2).max(0) as f32;
+    // while entering, the rect is still smaller than the laid-out text: clip text pixels to the card rect (design §7, final review Critical #2c).
+    canvas.set_clip(Some(rect));
+
     let mut y = rect.y + theme.card_padding;
-    text.draw(canvas, &n.summary, x, y, &theme.font, fa(urgency_color(n.urgency, theme)));
+    let summary = crate::text::truncate_to_width(&n.summary, inner_w, |t: &str| text.measure(t, &theme.font).0);
+    text.draw(canvas, &summary, x, y, &theme.font, fa(urgency_color(n.urgency, theme)));
     y += line;
-    if !n.body.is_empty() {
-        text.draw(canvas, &n.body, x, y, &theme.font, fa(theme.foreground));
+    for body_line in n.body.lines() {
+        let t = crate::text::truncate_to_width(body_line, inner_w, |t: &str| text.measure(t, &theme.font).0);
+        text.draw(canvas, &t, x, y, &theme.font, fa(theme.foreground));
         y += line;
     }
+
     let mut hits = Vec::new();
     if !n.actions.is_empty() {
         y += theme.card_gap / 2;
         let mut bx = x;
         for (key, label) in &n.actions {
-            let (w, _) = text.measure(label, &theme.font);
+            let t = crate::text::truncate_to_width(label, inner_w, |t: &str| text.measure(t, &theme.font).0);
+            let (w, _) = text.measure(&t, &theme.font);
             let br = Rect::new(bx, y, w.ceil() as i32 + theme.card_padding, line);
             canvas.fill_rounded_rect(br, line / 2, theme.accent);
-            text.draw(canvas, label, bx + theme.card_padding / 2, y, &theme.font, fa(theme.background));
+            text.draw(canvas, &t, bx + theme.card_padding / 2, y, &theme.font, fa(theme.background));
             hits.push((br, Action::NotificationAction { id: n.id, key: key.clone() }));
             bx = br.right() + theme.card_gap;
         }
     }
+
+    canvas.set_clip(None);
     hits
 }
 
@@ -147,7 +158,6 @@ mod tests {
         let mut text = crate::text::TextEngine::new();
         let n = crate::notify::queue::Notification {
             id: 1,
-            app_name: "app".into(),
             summary: "s".into(),
             body: "b".into(),
             urgency: crate::notify::queue::Urgency::Normal,
