@@ -1,0 +1,71 @@
+# cornice config template
+#
+# Install at: $XDG_CONFIG_HOME/cornice/config.toml (usually ~/.config/cornice/config.toml)
+#   mkdir -p ~/.config/cornice && cp config.toml ~/.config/cornice/config.toml
+#
+# When the file is missing, cornice starts on all defaults and does not error.
+# When it is wrong, cornice prints a `line:column` error to stderr and exits non-zero — no guessing, no silent downgrade.
+# Unknown keys, unknown module kinds and out-of-range numbers are all rejected (deny_unknown_fields).
+# Every line below is optional: delete it and the key returns to its default (see "default" in the comments).
+# Writing only the [bar.left] / [bar.center] / [bar.right] module lists is enough — that is where "consistency" comes from.
+
+[bar]
+# Bar height in pixels. Range 1..=256.
+# It is also the basis the shm pool size and the radius/padding are derived from, so the ceiling is defensive: a
+# mistyped number must not turn into a terabyte-scale allocation request.
+height  = 30        # default 30
+# Distance from the bar to the top edge of the screen, in pixels.
+margin  = 0         # default 0
+# Left/right inset inside the bar, in pixels. On top of that the rounded ends inset by another r*(1-1/√2) (4px at radius 15) —
+# a rounded end is not a straight edge, so a bbox measurement makes the inset look smaller than it is; this optical correction is tied to radius and is not configurable.
+padding = 8         # default 8
+# Gap between adjacent modules, in pixels.
+spacing = 6         # default 6
+
+[theme]
+# Colour syntax: #rgb / #rrggbb / #rrggbbaa (ASCII only)
+background = "#1a1a1aee"    # bar and notification card background, default #1a1a1aee
+foreground = "#dcdcdc"      # text colour, default #dcdcdc
+accent     = "#88c0d0"      # accent colour (critical notifications etc.), default #88c0d0
+# Font: "family size". Omit the size to keep the default size of 11.
+font       = "monospace 11" # default monospace 11
+# Corner radius in pixels. Absent = height/2, i.e. a capsule.
+radius     = 15             # default height/2
+# Note: the card gap (default height/5) and card padding (default height/2) can only be derived from height and are not configurable.
+# Text is placed by cap height (not by line box), so card_padding measures the visible whitespace:
+# the top of the first card line sits exactly one card_padding below the card's top edge, and the last line's baseline the same distance above the bottom edge.
+# The first card sits against the bar's bottom edge (no card_gap): it is the one stretching out of the bar, joined by the rounded shoulder tangent to the bar's bottom edge.
+
+# Each of the three areas is an ordered module list: reorder it to reorder them, delete an entry to switch it off.
+# No nested containers, no layout language — that is the whole meaning of "freedom to combine".
+
+[bar.left]
+# Built-in clock module: formats local time.
+#   format is a chrono format string, default "%H:%M".
+modules = [
+  { kind = "clock", format = "%H:%M" },
+]
+
+[bar.center]
+# An empty list = that area shows nothing.
+modules = []
+
+[bar.right]
+modules = [
+  # Built-in exec module: runs a shell command for as long as cornice lives and reads its stdout line by line as the module text.
+  #   command is required and is run via `sh -c`; after the child exits it is retried after a fixed 1s, no backoff.
+  #   format is a template where {out} is replaced by the output; when empty or omitted the raw output is shown.
+  # Battery capacity, read every 5 seconds:
+  { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
+  # 1-minute load average:
+  { kind = "exec", command = "while true; do awk '{print int($1)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
+]
+
+[notification]
+# Behaviour of the built-in notification daemon (the cards notify-send pops up).
+# How many cards are drawn at once; the rest stay queued undrawn. Default 4. Minimum 1.
+max_visible = 4
+# Enter animation duration (right cluster → card) in milliseconds, default 220.
+enter_ms    = 220
+# Exit animation duration (card → right cluster) in milliseconds, default 160.
+exit_ms     = 160

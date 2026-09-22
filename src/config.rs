@@ -213,6 +213,17 @@ max_visible = 3
         assert_eq!(c.notification.enter_ms, 220, "the default when absent");
     }
 
+    /// The shipped template is a document, not decoration: it must stay parseable.
+    #[test]
+    fn shipped_template_parses() {
+        let c = parse(include_str!("../config.toml")).unwrap();
+        assert_eq!(c.bar.height, 30);
+        assert_eq!(c.bar.margin, 0);
+        assert_eq!(c.bar.right.len(), 2);
+        assert_eq!(c.theme.radius, 15);
+        assert_eq!(c.notification.max_visible, 4);
+    }
+
     #[test]
     fn radius_defaults_to_half_height() {
         let c = parse("[bar]\nheight = 24\n").unwrap();
