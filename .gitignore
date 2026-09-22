@@ -58,6 +58,8 @@ $RECYCLE.BIN/
 *.log
 tmp/
 temp/
+__pycache__/
+testing/
 
 # ── Project-local notes / planning ───────────────────────────
 openspec/

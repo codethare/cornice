@@ -77,10 +77,22 @@ pub struct BarLayout {
     pub right_cluster: Rect,
 }
 
+/// Optical inset for the bar's rounded ends.
+///
+/// A pill's end is not a straight edge: the boundary curves away from the text, so a gap measured from
+/// the bounding box reads smaller than the measured one, and the eye hangs the text in the corner.
+/// Content is pushed in to the corner's 45° keyline, `r - r/√2` ≈ 0.29 r — the same rule keyline grids
+/// use when a circle has to read the same size as a square next to it:
+/// https://adamarant.com/en/blog/optical-alignment-in-ui-7-spacing-fixes-math-gets-wrong (with the
+/// landing rule: the correction belongs to the component, so it is derived from `radius`, not a knob).
+pub fn end_inset(radius: i32) -> i32 {
+    (radius.max(0) as f32 * (1.0 - std::f32::consts::FRAC_1_SQRT_2)).round() as i32
+}
+
 /// Each section lays its items out by `spacing`; center is allocated first among the three.
 pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout {
     let h = theme.height;
-    let p = theme.padding.max(0);
+    let p = (theme.padding + end_inset(theme.radius)).max(0);
     let s = theme.spacing.max(0);
 
     let run = |ws: &[i32], start: i32| -> Vec<Rect> {
@@ -120,9 +132,14 @@ pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout
     }
 
     let center = run(&widths.center, center_left);
-    let right_cluster = match (right.first(), right.last()) {
-        (Some(f), Some(l)) => Rect::new((f.x - p).min(output_w), 0, (l.right() - f.x + p * 2).max(0), h),
-        _ => Rect::new(output_w - p, 0, p, h),
+    // The island's t=0 rect has to reproduce the bar's own pixels, i.e. it must reach the screen edge
+    // (the bar's capsule is drawn to `output_w`, whatever inset the text keeps from it).
+    let right_cluster = match right.first() {
+        Some(f) => {
+            let x = (f.x - theme.padding).min(output_w);
+            Rect::new(x, 0, (output_w - x).max(0), h)
+        }
+        _ => Rect::new(output_w - theme.padding, 0, theme.padding, h),
     };
     BarLayout { left, center, right, right_cluster }
 }
@@ -160,17 +177,35 @@ mod tests {
 
     #[test]
     fn three_sections_are_placed_as_specified() {
-        let t = Theme::defaults(30); // padding 8, spacing 6
+        let t = Theme::defaults(30); // padding 8, spacing 6, radius 15
+        let i = end_inset(t.radius); // 4
+        assert_eq!(i, 4);
         let out = layout(&widths(&[20, 20], &[50], &[30, 30]), 1000, &t);
-        assert_eq!(out.left[0], Rect::new(8, 0, 20, 30));
-        assert_eq!(out.left[1], Rect::new(8 + 20 + 6, 0, 20, 30));
+        assert_eq!(out.left[0], Rect::new(8 + i, 0, 20, 30));
+        assert_eq!(out.left[1], Rect::new(8 + i + 20 + 6, 0, 20, 30));
         // center is centred on the screen midline, not on the space that is left over
         assert_eq!(out.center[0], Rect::new(500 - 25, 0, 50, 30));
         // right hugs the right edge; its internals still run left to right
-        assert_eq!(out.right[0], Rect::new(1000 - 8 - 66, 0, 30, 30));
-        assert_eq!(out.right[1], Rect::new(1000 - 8 - 30, 0, 30, 30));
-        // Right-cluster rect = the whole right section plus padding
-        assert_eq!(out.right_cluster, Rect::new(1000 - 8 - 66 - 8, 0, 66 + 16, 30));
+        assert_eq!(out.right[0], Rect::new(1000 - 8 - i - 66, 0, 30, 30));
+        assert_eq!(out.right[1], Rect::new(1000 - 8 - i - 30, 0, 30, 30));
+        // Right-cluster rect = the whole right section plus padding, out to the bar's rounded end
+        assert_eq!(out.right_cluster, Rect::new(1000 - 8 - i - 66 - 8, 0, 66 + 16 + i, 30));
+        assert_eq!(out.right_cluster.right(), 1000, "the island's t=0 rect must reach the screen edge");
+    }
+
+    /// Both ends keep the same optical inset, so the text does not look pinned to one corner of the pill.
+    #[test]
+    fn pill_ends_are_inset_by_the_corner_keyline() {
+        let t = Theme::defaults(30);
+        let i = end_inset(t.radius);
+        for radius in [0, 2, 15, 30] {
+            assert!(end_inset(radius) >= 0);
+            assert!(end_inset(radius) <= radius / 3 + 1, "the inset stays a corner correction, not a margin");
+        }
+        assert_eq!(end_inset(0), 0, "a square bar needs no corner correction");
+        let out = layout(&widths(&[10], &[], &[10]), 1000, &t);
+        assert_eq!(out.left[0].x, t.padding + i);
+        assert_eq!(out.right[0].right(), 1000 - t.padding - i);
     }
 
     #[test]

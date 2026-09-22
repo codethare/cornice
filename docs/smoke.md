@@ -49,21 +49,60 @@ WAYLAND_DISPLAY=wayland-1 timeout 5 ./target/debug/cornice; echo "exit=$?"
 - **Proves**: cornice attaches to layer-shell, `bar configured: 1280x30`, and the notification surface maps without panicking under a real notification sequence.
 - **Does not prove**: **sway uses wlroots' native layer-shell; river goes through the WM-forwarded `river-layer-shell-v1`, so behaviour is not guaranteed to match.** The sandbox has no screenshot tool, so "renders correctly" and "the animation feels right" cannot be verified here — only "it starts, the surface maps, it does not panic".
 
-## 4. river + tailrace (user-verified only)
+## 4. river + tailrace (`scripts/live/run.sh`)
 
-- [ ] After `cornice` starts a band appears at the top, its height matches `[bar] height`, and windows are not covered (the exclusive zone takes effect)
-- [ ] Left/center/right sections sit where the docs say; a non-existent module (e.g. `river.tags`) in the config produces an error with a line number
-- [ ] Notifications: after `notify-send "title" "body"` a card Morphs out of the right-hand bar component in the top-right corner
-- [ ] `notify-send -u critical ...` does not auto-dismiss; `notify-send -t 2000 ...` disappears after 2 seconds
-- [ ] Same-id replace: run `notify-send -r 1 ...` twice; the second updates in place and does not replay the animation
-- [ ] Multiple: once consecutive `notify-send` calls exceed `max_visible`, the extras stay hidden and slide in as earlier ones disappear
-- [ ] `notify-send --action=open=Open ...` shows a button, and clicking it produces an `ActionInvoked` visible in `dbus-monitor`
-- [ ] Clicking a card / middle-click → the card disappears and `NotificationClosed` (reason 2) is emitted
-- [ ] Click-through on transparent areas: regions outside the notification cards still reach the window below
-- [ ] **Multi-monitor: notifications appear only on the first output that has a bar** — a known compromise (see below), not a bug
-- [ ] When idle, `powertop` or `perf stat` shows no sustained 60fps-level wakeups
+The target stack, headless: real `river`, real `tailrace` as the WM, real `cornice` — one shell script, nothing
+mocked. It starts `WLR_BACKENDS=headless` river with tailrace (the compositor and the WM are read-only inputs,
+never modified), runs cornice under a private session bus, and then checks pixels and input:
+
+* **pixels** from `grim` (river's `wlr-screencopy`), analysed by `scripts/live/shot.py` (stdlib Python, no PIL)
+* **a window** from `scripts/live/probe.c win` — a coloured `xdg_toplevel` that logs pointer events — to prove the
+  exclusive zone and click-through
+* **a pointer** from `scripts/live/probe.c vp` — `zwlr_virtual_pointer_v1` (river advertises it), `at X Y` warps and
+  clicks like a real mouse
+* **notifications** from `gdbus` on the private bus, with `dbus-monitor` capturing `NotificationClosed`/`ActionInvoked`
+
+```sh
+cargo build && (cd ../tailrace && cargo build --release)
+bash scripts/live/run.sh          # 50 checks, exit code = failures
+python3 scripts/live/artifacts.py # rebuild testing/*.png from the run's screenshots
+```
+
+Environment overrides: `RIVER_BIN`, `TAILRACE_BIN`, `CORNICE_BIN`, `W` (scratch dir, default `/tmp/cornice-live`);
+logs, screenshots and the test config stay under `W`. Needs `grim`, `gcc`, `wayland-scanner`, `dbus-run-session`,
+`gdbus`. It kills only the PIDs it started (a `pkill river` would kill a real session).
+
+Checks: bar band and height, left/center/right placement and the optical inset at the bar's rounded ends,
+a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), card geometry and that
+the head card is one unbroken silhouette with the bar, `expire_timeout` / critical / `CloseNotification`, expiry
+emits `NotificationClosed` reason 1, a replace stays put while a new id is still morphing (the island animation,
+measured), `max_visible` stacking, card click → reason 2, action button → `ActionInvoked`, click-through on a
+transparent region, idle CPU, config errors with line numbers, and the two-output behaviour.
+
+- **Proves**: the whole checklist below except the two items marked *(human)* — on river + tailrace, with pixels and pointer input.
+- **Does not prove**: that the animation *feels* right (the harness measures rects, it cannot judge easing), anything
+  about real hardware (libinput devices, GPU, multi-monitor geometry), and the multi-output check only asserts
+  "exactly one output" (see the compromise below).
+
+### Manual pass on the real machine
+
+- [ ] *(human)* The island animation reads as "growing out of the right bar component" — to watch it slowly, set
+      `[notification] enter_ms = 60000` and take a screenshot every second: the card grows downwards out of the bar's
+      bottom edge at the right cluster (its top edge never leaves the bar) while its shoulders stay joined to the bar
+- [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
+      the left and right gaps should read the same (`docs/smoke.md`, `testing/README.md` "Text placement")
+- [ ] *(human)* `notify-send -u critical ...` does not auto-dismiss; `notify-send -t 2000 ...` disappears after 2 seconds
+      (the harness drives the same D-Bus API with `gdbus`; `notify-send` itself is not installed here)
+- [ ] *(human)* `powertop`/`perf stat`: no sustained 60fps wakeups (the harness measures CPU time as a proxy: < 50 ticks
+      per 5 idle seconds)
+- [ ] *(human)* Multi-monitor with a real second output: the bar appears on both, notifications on one
 
 ### Known compromises (read first)
 
-- **Multi-monitor**: notifications are pinned to "the first output that has a bar". layer-shell client surfaces are **non-interactive** (keyboard focus is invisible), so there is no way to know which output currently has focus — hence design doc §7's "deliver to the focused output" cannot be implemented. Upgrade path: create one notification surface per output and show the same queue on each.
+- **Multi-monitor**: notifications are pinned to one output — the one `ensure_notif_surface` happens to pick from
+  `bars.keys().next()`, i.e. **HashMap order**, not "the first output" in any stable sense (measured: output 2 in
+  one run, output 1 in the next).
+  layer-shell client surfaces are **non-interactive** (keyboard focus is invisible), so there is no way to know which
+  output currently has focus — hence design doc §7's "deliver to the focused output" cannot be implemented.
+  Upgrade path: create one notification surface per output and show the same queue on each.
 - **Target-environment gap**: passing section 3 on sway does not mean passing on river + tailrace (river's layer-shell is forwarded by the WM).

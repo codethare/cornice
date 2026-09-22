@@ -204,7 +204,12 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
 
     // Idle timer: handles the per-second clock tick and notification expiry only; animation frames come from a separate frame source (see ensure_frame_source).
     // so animating is passed as a fixed false here — otherwise it would form two 16ms sources with the frame source during animation.
-    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |now, _meta, state: &mut State| {
+    // A calloop timer's event is the *deadline* it was scheduled for, not the current time (calloop-0.14
+    // sources/timer.rs: "can be earlier than the current time depending on the event loop congestion"), and
+    // `ToInstant(deadline + 16ms)` lets that deadline fall further behind on every slow frame. tweening and
+    // expiry compare it against `Instant::now()` stamps, so the deadline is not a usable clock here: take the clock here.
+    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |_deadline, _meta, state: &mut State| {
+        let now = Instant::now();
         state.on_wake(now);
         TimeoutAction::ToInstant(next_deadline(now, false, state.queue.next_expiry()))
     }).map_err(|e| format!("failed to insert the timer: {e}"))?;
@@ -288,7 +293,8 @@ impl State {
         }
         let token = self.loop_handle.insert_source(
             Timer::from_duration(FRAME_INTERVAL),
-            |now, _meta, state: &mut State| {
+            |_deadline, _meta, state: &mut State| {
+                let now = Instant::now(); // the deadline drifts behind real time on slow frames; see the idle timer above
                 state.on_wake(now);
                 if state.animating {
                     TimeoutAction::ToInstant(now + FRAME_INTERVAL)
@@ -321,10 +327,8 @@ impl State {
         let lines_per_card = 1 + crate::notify::queue::MAX_BODY_LINES as i32 + 1;
         let per_card = self.theme.card_padding * 2 + line * lines_per_card + self.theme.card_gap;
         let n = self.cfg.notification.max_visible as i32;
-        let h = self.cfg.bar.margin
-            + self.cfg.bar.height
-            + self.theme.card_gap
-            + n * (per_card + self.theme.card_gap);
+        // The head card hangs straight off the bar; only the gaps between cards are added.
+        let h = self.cfg.bar.margin + self.cfg.bar.height + n * per_card;
         h.max(1) as u32
     }
 
@@ -338,7 +342,9 @@ impl State {
         for n in visible {
             sizes.push(crate::notify::view::card_size(n, &mut self.text, &self.theme));
         }
-        let top = self.theme.height + self.theme.card_gap;
+        // The head card starts at the bar's bottom edge, not below a gap: that shared edge is what
+        // makes the card read as extruded from the bar instead of parked under it.
+        let top = self.theme.height;
         let rects = crate::notify::view::card_rects(visible.len(), &sizes, output_w, &self.theme, top);
         (island, rects)
     }
@@ -558,6 +564,8 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
         (&l.center[..], &mut sections.center[..]),
         (&l.right[..], &mut sections.right[..]),
     ];
+    // One baseline for the whole bar: all modules share the style, so the cap-height centre is the same.
+    let top = text.optical_top(&theme.font, 0, theme.height);
     for (rects, modules) in rows {
         for (r, m) in rects.iter().zip(modules.iter_mut()) {
             if r.is_empty() { continue; }
@@ -565,7 +573,7 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
             let mut x = r.x;
             for s in spans {
                 let color = s.color.unwrap_or(theme.foreground);
-                text.draw(&mut c, &s.text, x, r.y + (r.h - theme.font.size as i32) / 2 - 2, &theme.font, color);
+                text.draw(&mut c, &s.text, x, top, &theme.font, color);
                 x += text.measure(&s.text, &theme.font).0.ceil() as i32;
             }
         }

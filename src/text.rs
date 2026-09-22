@@ -1,5 +1,7 @@
 //! cosmic-text wrapper: text shaping, rasterisation and width-based truncation.
 
+use std::collections::HashMap;
+
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 
 use crate::canvas::Canvas;
@@ -14,16 +16,89 @@ impl TextStyle {
     }
 }
 
+/// Where the capital letters actually sit inside the line box, in pixels.
+///
+/// A line box is `line_height` tall whatever the string is, but the ink inside it is not: the leading
+/// above the cap and the descent below the baseline are empty for a string like `09:19`. Padding the
+/// box and centring the box therefore put the ink off by `(line_height - cap) / 2` — the classic "a
+/// label in a button looks low" defect. CSS now fixes this with `text-box: trim-both cap alphabetic`;
+/// these metrics are the same trim, applied by hand (cap height is 65–75% of the em, so the error is
+/// 2–4 px at UI sizes): https://developer.mozilla.org/en-US/docs/Web/CSS/text-box-trim
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CapMetrics {
+    /// Distance from the line-box top to the top of a capital `H`.
+    pub top: f32,
+    /// Cap height (the `H` ink height).
+    pub cap: f32,
+}
+
 pub struct TextEngine {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    /// Measured once per (family, size): rasterising `H` is the only reliable way to learn the ink
+    /// offsets, and it is done on the first frame that needs them.
+    cap_cache: HashMap<(String, u32), CapMetrics>,
 }
 
 impl Default for TextEngine { fn default() -> Self { Self::new() } }
 
 impl TextEngine {
     pub fn new() -> Self {
-        Self { font_system: FontSystem::new(), swash_cache: SwashCache::new() }
+        Self { font_system: FontSystem::new(), swash_cache: SwashCache::new(), cap_cache: HashMap::new() }
+    }
+
+    /// Rasterise a single `H` into a scratch canvas and read the ink rows back out.
+    fn measure_cap(&mut self, style: &TextStyle) -> CapMetrics {
+        let line = Self::line_height(style);
+        let (w, _) = self.measure("H", style);
+        let pw = (w.ceil() as i32 + 4).max(4);
+        let ph = (line.ceil() as i32 + 4).max(4);
+        let mut data = vec![0u8; (pw * ph * 4) as usize];
+        {
+            let mut canvas = Canvas::new(&mut data, pw, ph);
+            // Drawn at y = 1 so a glyph whose ink starts on the very first row is still distinguishable from "no ink".
+            self.draw(&mut canvas, "H", 1, 1, style, Color::rgba(0xff, 0xff, 0xff, 0xff));
+        }
+        let mut top = None;
+        let mut bottom = 0;
+        for y in 0..ph {
+            for x in 0..pw {
+                if data[((y * pw + x) * 4) as usize + 3] != 0 {
+                    top.get_or_insert(y);
+                    bottom = y;
+                }
+            }
+        }
+        match top {
+            Some(t) => CapMetrics { top: (t - 1) as f32, cap: (bottom - t + 1) as f32 },
+            // No font at all: fall back to the box ratios rather than panicking.
+            None => CapMetrics { top: (line - style.size) / 2.0, cap: style.size },
+        }
+    }
+
+    pub fn cap_metrics(&mut self, style: &TextStyle) -> CapMetrics {
+        let key = (style.family.clone(), style.size.to_bits());
+        if let Some(m) = self.cap_cache.get(&key) {
+            return *m;
+        }
+        let m = self.measure_cap(style);
+        self.cap_cache.insert(key, m);
+        m
+    }
+
+    /// The `top` to pass to `draw` so the *cap height* is centred in `box_y .. box_y + box_h`,
+    /// instead of the line box (which carries ascender and descender space the ink never uses).
+    pub fn optical_top(&mut self, style: &TextStyle, box_y: i32, box_h: i32) -> i32 {
+        let m = self.cap_metrics(style);
+        let centre = box_y as f32 + box_h as f32 / 2.0;
+        (centre - m.cap / 2.0 - m.top).round() as i32
+    }
+
+    /// The `top` to pass to `draw` so the cap's top edge sits `pad` below `box_y` — the text-block
+    /// equivalent of `optical_top`, used where the block is top-aligned (a notification card).
+    pub fn cap_top(&mut self, style: &TextStyle, box_y: i32, pad: i32) -> i32 {
+        let m = self.cap_metrics(style);
+        box_y + pad - m.top.round() as i32
     }
 
     /// The returned `Attrs` borrows `style` rather than self — otherwise it would hold an immutable borrow of self until
@@ -67,8 +142,10 @@ impl TextEngine {
         let mut buffer = buffer.borrow_with(&mut self.font_system);
         buffer.set_size(None, None);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
-        // The baseline sits about 0.75 of the line height below the box top, close enough for a flat horizontal bar
-        let baseline = top + (line * 0.75) as i32;
+        // cosmic-text's draw callback already reports each glyph image relative to the text box top (its own
+        // baseline included), so `top` is used as-is: adding 0.75*line here drew every string one baseline too
+        // low — the bar's text 2px off the bottom edge, and the card's action pill on top of the last body line.
+        let baseline = top;
         buffer.draw(&mut self.swash_cache, cosmic_text::Color::rgba(color.r, color.g, color.b, color.a), |gx, gy, gw, gh, gc| {
             // The colour the callback hands back carries the pixel's coverage alpha; scale the caller's colour by it, then blend the whole block
             let a = gc.a();
@@ -126,5 +203,33 @@ mod tests {
     fn truncate_degenerate_budget() {
         assert_eq!(truncate_to_width("abcdef", 0.0, fake), "");
         assert_eq!(truncate_to_width("", 50.0, fake), "");
+    }
+
+    /// The point of the cap metrics: whatever the font, the *ink* ends up centred in the box.
+    #[test]
+    fn optical_top_centres_the_cap_height() {
+        let mut e = TextEngine::new();
+        let style = TextStyle::new(11.0, "monospace");
+        let m = e.cap_metrics(&style);
+        assert!(m.cap > 0.0, "a cap height must be measurable: {m:?}");
+        for box_h in [16, 30, 40] {
+            let top = e.optical_top(&style, 0, box_h);
+            let ink = top as f32 + m.top;
+            let cap_centre = ink + m.cap / 2.0;
+            assert!(
+                (cap_centre - box_h as f32 / 2.0).abs() <= 0.5,
+                "box {box_h}: cap centre {cap_centre} should be at {}",
+                box_h as f32 / 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn cap_top_puts_the_cap_exactly_pad_below_the_edge() {
+        let mut e = TextEngine::new();
+        let style = TextStyle::new(11.0, "monospace");
+        let m = e.cap_metrics(&style);
+        let ink = e.cap_top(&style, 100, 15) as f32 + m.top;
+        assert_eq!(ink, 115.0, "the ink top must land on the padding edge");
     }
 }
