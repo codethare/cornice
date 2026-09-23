@@ -8,7 +8,7 @@ Each section states what it **can prove** and what it **cannot prove**. The firs
 cargo test
 ```
 
-Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout, the `clock`/`exec` modules, easing and tweening, the notification queue state machine, and notification card geometry and hit testing.
+Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine, and the notification column — its geometry, the stretch, hit testing and that it paints no background inside the bar.
 
 - **Proves**: pure logic has no regressions.
 - **Does not prove**: any pixels, any protocol behaviour.
@@ -64,7 +64,7 @@ never modified), runs cornice under a private session bus, and then checks pixel
 
 ```sh
 cargo build && (cd ../tailrace && cargo build --release)
-bash scripts/live/run.sh          # 50 checks, exit code = failures
+bash scripts/live/run.sh          # 52 checks, exit code = failures
 python3 scripts/live/artifacts.py # rebuild testing/*.png from the run's screenshots
 ```
 
@@ -73,11 +73,13 @@ logs, screenshots and the test config stay under `W`. Needs `grim`, `gcc`, `wayl
 `gdbus`. It kills only the PIDs it started (a `pkill river` would kill a real session).
 
 Checks: bar band and height, left/center/right placement and the optical inset at the bar's rounded ends,
-a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), card geometry and that
-the head card is one unbroken silhouette with the bar, `expire_timeout` / critical / `CloseNotification`, expiry
-emits `NotificationClosed` reason 1, a replace stays put while a new id is still morphing (the island animation,
-measured), `max_visible` stacking, card click → reason 2, action button → `ActionInvoked`, click-through on a
-transparent region, idle CPU, config errors with line numbers, and the two-output behaviour.
+a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), that a short card is drawn
+*inside* the bar while a long body stretches the same background below it (one unbroken column from the bar's row
+down, attaching where the pill's bottom edge is straight), that a second card keeps stretching the same shape,
+`expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed` reason 1, a replace stays put
+while a new id is still stretching (measured), `max_visible` stacking, card click → reason 2, action button →
+`ActionInvoked`, click-through on a transparent region, idle CPU, config errors with line numbers, and the
+two-output behaviour.
 
 - **Proves**: the whole checklist below except the two items marked *(human)* — on river + tailrace, with pixels and pointer input.
 - **Does not prove**: that the animation *feels* right (the harness measures rects, it cannot judge easing), anything
@@ -86,11 +88,12 @@ transparent region, idle CPU, config errors with line numbers, and the two-outpu
 
 ### Manual pass on the real machine
 
-- [ ] *(human)* The island animation reads as "growing out of the right bar component" — to watch it slowly, set
-      `[notification] enter_ms = 60000` and take a screenshot every second: the card grows downwards out of the bar's
-      bottom edge at the right cluster (its top edge never leaves the bar) while its shoulders stay joined to the bar
+- [ ] *(human)* The stretch reads as the bar's own material pulling downwards — to watch it slowly, set
+      `[notification] enter_ms = 60000` and take a screenshot every second: the column's top edge stays at the bar's
+      top while its bottom edge walks down, and at no frame is there a lighter or darker band where the two meet
+- [ ] *(human)* `notify-send -r <id>` on a visible card updates it in place, without replaying the stretch
 - [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
-      the left and right gaps should read the same (`docs/smoke.md`, `testing/README.md` "Text placement")
+      the left and right gaps should read the same (`docs/smoke.md`)
 - [ ] *(human)* `notify-send -u critical ...` does not auto-dismiss; `notify-send -t 2000 ...` disappears after 2 seconds
       (the harness drives the same D-Bus API with `gdbus`; `notify-send` itself is not installed here)
 - [ ] *(human)* `powertop`/`perf stat`: no sustained 60fps wakeups (the harness measures CPU time as a proxy: < 50 ticks

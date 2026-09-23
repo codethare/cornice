@@ -8,36 +8,42 @@ use crate::text::{truncate_to_width, TextEngine};
 use crate::theme::Theme;
 use crate::widget::{Event, Module, Span};
 
-pub use modules::{Clock, Exec};
+pub use modules::{Clock, Exec, Notify};
 
 pub struct Sections {
     pub left: Vec<Box<dyn Module>>,
     pub center: Vec<Box<dyn Module>>,
     pub right: Vec<Box<dyn Module>>,
+    /// (section, index) of the `notification` module: the only module whose width comes from outside itself.
+    notif_at: Option<(usize, usize)>,
+    /// Width the notification module reserves in the bar: the widest visible card, 0 while nothing is visible.
+    notif_width: i32,
 }
+
+/// Section index as used by `notif_at`.
+const SEC_LEFT: usize = 0;
+const SEC_CENTER: usize = 1;
+const SEC_RIGHT: usize = 2;
 
 impl Sections {
     /// Returns (sections, the receiving end of the exec line channel); `State` attaches the receiver to calloop.
     pub fn from_config(cfg: &Config) -> (Self, calloop::channel::Channel<Event>) {
         let (exec_tx, exec_rx) = calloop::channel::channel::<Event>();
         let mut exec_id = 0usize;
-        let build = |specs: &[crate::config::ModuleSpec], exec_id: &mut usize| -> Vec<Box<dyn Module>> {
-            specs
-                .iter()
-                .map(|s| match s {
-                    crate::config::ModuleSpec::Clock { format } => Box::new(Clock::new(format.clone())) as Box<dyn Module>,
-                    crate::config::ModuleSpec::Exec { command, format } => {
-                        *exec_id += 1;
-                        Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), exec_tx.clone())) as Box<dyn Module>
-                    }
-                })
-                .collect()
-        };
-        let left = build(&cfg.bar.left, &mut exec_id);
-        let center = build(&cfg.bar.center, &mut exec_id);
-        let right = build(&cfg.bar.right, &mut exec_id);
-        (Self { left, center, right }, exec_rx)
+        let mut notif_at = None;
+        let left = build(&cfg.bar.left, SEC_LEFT, &mut notif_at, &mut exec_id, &exec_tx);
+        let center = build(&cfg.bar.center, SEC_CENTER, &mut notif_at, &mut exec_id, &exec_tx);
+        let right = build(&cfg.bar.right, SEC_RIGHT, &mut notif_at, &mut exec_id, &exec_tx);
+        (Self { left, center, right, notif_at, notif_width: 0 }, exec_rx)
     }
+
+    /// Where the notification module sits, if it is configured at all: without it the stretch has nowhere to
+    /// hang off the bar and notifications are simply not drawn.
+    pub fn notif_at(&self) -> Option<(usize, usize)> { self.notif_at }
+
+    pub fn notif_width(&self) -> i32 { self.notif_width }
+
+    pub fn set_notif_width(&mut self, w: i32) { self.notif_width = w.max(0); }
 
     pub fn update(&mut self, ev: &Event) -> bool {
         let mut dirty = false;
@@ -47,23 +53,54 @@ impl Sections {
         dirty
     }
 
-    fn widths_of(modules: &mut [Box<dyn Module>], text: &mut TextEngine, theme: &Theme) -> Vec<i32> {
+    fn widths_of(modules: &mut [Box<dyn Module>], text: &mut TextEngine, theme: &Theme, notif: Option<(usize, i32)>) -> Vec<i32> {
         modules
             .iter_mut()
-            .map(|m| {
-                let total: f32 = m.spans().iter().map(|s| text.measure(&s.text, &theme.font).0).sum();
-                total.ceil() as i32
+            .enumerate()
+            .map(|(i, m)| match notif {
+                Some((idx, w)) if idx == i => w,
+                _ => {
+                    let total: f32 = m.spans().iter().map(|s| text.measure(&s.text, &theme.font).0).sum();
+                    total.ceil() as i32
+                }
             })
             .collect()
     }
 
     pub fn widths(&mut self, text: &mut TextEngine, theme: &Theme) -> SectionWidths {
+        let notif = self.notif_at;
+        let nw = self.notif_width;
+        let of = |sec: usize| notif.filter(|(s, _)| *s == sec).map(|(_, i)| (i, nw));
         SectionWidths {
-            left: Self::widths_of(&mut self.left, text, theme),
-            center: Self::widths_of(&mut self.center, text, theme),
-            right: Self::widths_of(&mut self.right, text, theme),
+            left: Self::widths_of(&mut self.left, text, theme, of(SEC_LEFT)),
+            center: Self::widths_of(&mut self.center, text, theme, of(SEC_CENTER)),
+            right: Self::widths_of(&mut self.right, text, theme, of(SEC_RIGHT)),
         }
     }
+}
+
+fn build(
+    specs: &[crate::config::ModuleSpec],
+    sec: usize,
+    notif_at: &mut Option<(usize, usize)>,
+    exec_id: &mut usize,
+    exec_tx: &calloop::channel::Sender<Event>,
+) -> Vec<Box<dyn Module>> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| match s {
+            crate::config::ModuleSpec::Clock { format } => Box::new(Clock::new(format.clone())) as Box<dyn Module>,
+            crate::config::ModuleSpec::Exec { command, format } => {
+                *exec_id += 1;
+                Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), exec_tx.clone())) as Box<dyn Module>
+            }
+            crate::config::ModuleSpec::Notification => {
+                notif_at.get_or_insert((sec, i));
+                Box::new(Notify) as Box<dyn Module>
+            }
+        })
+        .collect()
 }
 
 pub struct SectionWidths { pub left: Vec<i32>, pub center: Vec<i32>, pub right: Vec<i32> }
@@ -73,8 +110,19 @@ pub struct BarLayout {
     pub left: Vec<Rect>,
     pub center: Vec<Rect>,
     pub right: Vec<Rect>,
-    /// The whole right section including padding; the notification's t=0 origin must be it
-    pub right_cluster: Rect,
+}
+
+impl BarLayout {
+    /// The rect the module at `(section, index)` was laid out into (0 = left, 1 = center, 2 = right);
+    /// it is where the notification stretch hangs off the bar.
+    pub fn slot(&self, at: (usize, usize)) -> Option<Rect> {
+        let v = match at.0 {
+            SEC_LEFT => &self.left,
+            SEC_CENTER => &self.center,
+            _ => &self.right,
+        };
+        v.get(at.1).copied()
+    }
 }
 
 /// Optical inset for the bar's rounded ends.
@@ -97,9 +145,26 @@ pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout
 
     let run = |ws: &[i32], start: i32| -> Vec<Rect> {
         let mut x = start;
-        ws.iter().map(|w| { let r = Rect::new(x, 0, *w, h); x += w + s; r }).collect()
+        ws.iter()
+            .map(|w| {
+                let r = Rect::new(x, 0, *w, h);
+                // A module that draws nothing (the notification module with an empty queue) takes no gap either,
+                // so the modules beside it do not shift when the first card appears.
+                if *w > 0 {
+                    x += w + s;
+                }
+                r
+            })
+            .collect()
     };
-    let total = |ws: &[i32]| if ws.is_empty() { 0 } else { ws.iter().sum::<i32>() + s * (ws.len() as i32 - 1) };
+    let total = |ws: &[i32]| {
+        let filled = ws.iter().filter(|w| **w > 0).count() as i32;
+        if filled == 0 {
+            0
+        } else {
+            ws.iter().sum::<i32>() + s * (filled - 1)
+        }
+    };
 
     let center_total = total(&widths.center);
     let center_left = output_w / 2 - center_total / 2;
@@ -132,16 +197,7 @@ pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout
     }
 
     let center = run(&widths.center, center_left);
-    // The island's t=0 rect has to reproduce the bar's own pixels, i.e. it must reach the screen edge
-    // (the bar's capsule is drawn to `output_w`, whatever inset the text keeps from it).
-    let right_cluster = match right.first() {
-        Some(f) => {
-            let x = (f.x - theme.padding).min(output_w);
-            Rect::new(x, 0, (output_w - x).max(0), h)
-        }
-        _ => Rect::new(output_w - theme.padding, 0, theme.padding, h),
-    };
-    BarLayout { left, center, right, right_cluster }
+    BarLayout { left, center, right }
 }
 
 /// Module text wider than the available space is truncated so it never crosses into a neighbouring section.
@@ -188,9 +244,9 @@ mod tests {
         // right hugs the right edge; its internals still run left to right
         assert_eq!(out.right[0], Rect::new(1000 - 8 - i - 66, 0, 30, 30));
         assert_eq!(out.right[1], Rect::new(1000 - 8 - i - 30, 0, 30, 30));
-        // Right-cluster rect = the whole right section plus padding, out to the bar's rounded end
-        assert_eq!(out.right_cluster, Rect::new(1000 - 8 - i - 66 - 8, 0, 66 + 16 + i, 30));
-        assert_eq!(out.right_cluster.right(), 1000, "the island's t=0 rect must reach the screen edge");
+        // the slot lookup is how the notification stretch finds the module it hangs off
+        assert_eq!(out.slot((SEC_RIGHT, 1)), Some(Rect::new(1000 - 8 - i - 30, 0, 30, 30)));
+        assert_eq!(out.slot((SEC_CENTER, 5)), None);
     }
 
     /// Both ends keep the same optical inset, so the text does not look pinned to one corner of the pill.
@@ -208,12 +264,39 @@ mod tests {
         assert_eq!(out.right[0].right(), 1000 - t.padding - i);
     }
 
+    /// The notification module contributes the card's width, not a measured text width, and it is the layout
+    /// that makes room for the card; the other modules shift by exactly that much.
     #[test]
-    fn empty_sections_give_empty_right_cluster_at_right_edge() {
+    fn the_notification_module_reserves_the_card_width() {
+        let cfg = crate::config::parse(
+            "[bar.right]\nmodules = [ { kind = \"notification\" }, { kind = \"clock\", format = \"%H\" } ]\n",
+        )
+        .unwrap();
+        let (mut s, _rx) = Sections::from_config(&cfg);
+        assert_eq!(s.notif_at(), Some((SEC_RIGHT, 0)));
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        assert_eq!(s.widths(&mut text, &t).right[0], 0, "an empty queue reserves nothing");
+        s.set_notif_width(240);
+        let w = s.widths(&mut text, &t);
+        assert_eq!(w.right[0], 240);
+        assert!(w.right[1] > 0, "the clock still measures its own text");
+        let out = layout(&w, 1000, &t);
+        assert_eq!(out.right[0].w, 240, "the card's width is reserved in the bar");
+        assert_eq!(out.right[1].x, out.right[0].right() + t.spacing, "the clock sits beside it");
+        // An empty queue reserves nothing and takes no gap either: the bar looks untouched until a card arrives.
+        s.set_notif_width(0);
+        let w0 = s.widths(&mut text, &t);
+        assert_eq!(w0.right[0], 0);
+        let out0 = layout(&w0, 1000, &t);
+        assert_eq!(out0.right[1].right(), 1000 - t.padding - end_inset(t.radius), "the clock stays flush right");
+    }
+
+    #[test]
+    fn empty_sections_stay_empty() {
         let t = Theme::defaults(30);
         let out = layout(&widths(&[], &[], &[]), 1000, &t);
         assert!(out.left.is_empty() && out.right.is_empty() && out.center.is_empty());
-        assert_eq!(out.right_cluster, Rect::new(1000 - t.padding, 0, t.padding, 30));
     }
 
     #[test]

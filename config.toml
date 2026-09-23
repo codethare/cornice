@@ -59,13 +59,18 @@ modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
   # 1-minute load average:
   { kind = "exec", command = "while true; do awk '{print int($1)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
+  # The notification daemon's cards. The module marks where the bar's material stretches: the first card is
+  # shown inside the bar, and a long body (or a second card) stretches the same background further down, never
+  # separating from the bar. It may be configured once, in any of the three sections.
+  { kind = "notification" },
 ]
 
 [notification]
-# Behaviour of the built-in notification daemon (the cards notify-send pops up).
+# Behaviour of the built-in notification daemon (the cards notify-send pops up). The cards are drawn at the
+# place where a `notification` module sits (see [bar.right] above); without that module nothing is drawn.
 # How many cards are drawn at once; the rest stay queued undrawn. Default 4. Minimum 1.
 max_visible = 4
-# Enter animation duration (right cluster → card) in milliseconds, default 220.
+# Stretch duration of the column below the bar, in milliseconds, default 220.
 enter_ms    = 220
-# Exit animation duration (card → right cluster) in milliseconds, default 160.
+# Retract duration, in milliseconds, default 160.
 exit_ms     = 160

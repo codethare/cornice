@@ -1,4 +1,4 @@
-//! Built-in modules: `clock` and `exec`.
+//! Built-in modules: `clock`, `exec` and the notification module.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -7,6 +7,16 @@ use std::time::Duration;
 use chrono::Local;
 
 use crate::widget::{Event, Module, Span};
+
+/// The `notification` module holds no text of its own: the card is drawn by the notification surface, which is
+/// the only surface that can reach below the bar. The module marks where the stretch hangs off the bar and
+/// reserves its width there, so the neighbouring modules never collide with the card.
+pub struct Notify;
+
+impl Module for Notify {
+    fn update(&mut self, _ev: &Event) -> bool { false }
+    fn spans(&self) -> Vec<Span> { Vec::new() }
+}
 
 pub struct Clock { pub format: String, pub text: String }
 

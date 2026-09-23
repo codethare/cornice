@@ -21,22 +21,24 @@ ROOT = HERE.parent.parent
 FULL = [
     ("bar.png", "bar"),
     ("exclusive-zone-window.png", "win"),
-    ("notification-card.png", "nt1"),
+    ("notification-in-bar.png", "short"),
+    ("notification-card.png", "long"),
+    ("notification-two-cards.png", "two"),
     ("notification-critical-urgency.png", "nt3"),
     ("notification-stack-max4.png", "stack"),
     ("notification-action-button.png", "action"),
     ("click-through.png", "through"),
     ("multi-output-1.png", "mo1n"),
     ("multi-output-2.png", "mo2n"),
-    ("island-morph-mid-enter.png", "fresh"),
+    ("stretch-mid-enter.png", "fresh"),
 ]
 DETAIL = [
-    ("detail-bar-right-5x.png", "nt1", (1080, 0, 200, 32, 5)),
+    ("detail-bar-right-5x.png", "long", (1080, 0, 200, 32, 5)),
     ("detail-card-action-4x.png", "action", (1150, 30, 130, 70, 4)),
     ("detail-stack-3x.png", "stack", (1140, 0, 140, 290, 3)),
 ]
-# enter-morph filmstrip: the frames demo.sh recorded while the head card grew out of the bar
-STRIP = ("detail-island-morph-filmstrip.png", [18, 20, 22, 24, 26, 28, 31], (1150, 0, 130, 100, 3))
+# enter filmstrip: the frames demo.sh recorded while the column stretched out of the bar
+STRIP = ("detail-stretch-filmstrip.png", [18, 20, 22, 24, 26, 28, 31], (1150, 0, 130, 100, 3))
 
 
 def read_ppm(path):

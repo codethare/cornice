@@ -38,6 +38,8 @@ pub struct Bar {
 pub enum ModuleSpec {
     Clock { #[serde(default = "default_clock_format")] format: String },
     Exec { command: String, #[serde(default)] format: String },
+    /// The notification daemon's cards: the module marks where the bar's material stretches downwards.
+    Notification,
 }
 
 fn default_clock_format() -> String { "%H:%M".to_string() }
@@ -60,7 +62,7 @@ struct RawBar {
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct RawSection { modules: Vec<ModuleSpec> }
+struct RawSection { modules: Vec<Spanned<ModuleSpec>> }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -113,8 +115,28 @@ fn height_at(text: &str, v: &Option<Spanned<i32>>) -> Result<i32, String> {
     Ok(h)
 }
 
+fn modules_of(spanned: &[Spanned<ModuleSpec>]) -> Vec<ModuleSpec> { spanned.iter().map(|m| m.get_ref().clone()).collect() }
+
+/// One stretch can only hang off one place, so the module may be configured once.
+fn no_duplicate_notification(text: &str, sections: [&[Spanned<ModuleSpec>]; 3]) -> Result<(), String> {
+    let mut seen = false;
+    for s in sections {
+        for m in s {
+            if matches!(m.get_ref(), ModuleSpec::Notification) {
+                if seen {
+                    let (l, c) = line_col(text, m.span().start);
+                    return Err(format!("{l}:{c}: notification: the notification module may be configured only once"));
+                }
+                seen = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("{e}"))?;
+    no_duplicate_notification(text, [&raw.bar.left.modules, &raw.bar.center.modules, &raw.bar.right.modules])?;
 
     let height = height_at(text, &raw.bar.height)?;
     let mut theme = Theme::defaults(height);
@@ -132,9 +154,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
         bar: Bar {
             height,
             margin: raw.bar.margin.unwrap_or(0),
-            left: raw.bar.left.modules,
-            center: raw.bar.center.modules,
-            right: raw.bar.right.modules,
+            left: modules_of(&raw.bar.left.modules),
+            center: modules_of(&raw.bar.center.modules),
+            right: modules_of(&raw.bar.right.modules),
         },
         theme,
         notification: Notification {
@@ -219,9 +241,20 @@ max_visible = 3
         let c = parse(include_str!("../config.toml")).unwrap();
         assert_eq!(c.bar.height, 30);
         assert_eq!(c.bar.margin, 0);
-        assert_eq!(c.bar.right.len(), 2);
+        assert_eq!(c.bar.right.len(), 3);
+        assert_eq!(c.bar.right[2], ModuleSpec::Notification);
         assert_eq!(c.theme.radius, 15);
         assert_eq!(c.notification.max_visible, 4);
+    }
+
+    /// The stretch can only hang off one module, so a second `notification` entry is a config error that
+    /// points at it — not a silently ignored duplicate.
+    #[test]
+    fn the_notification_module_is_allowed_once() {
+        let c = parse("[bar.right]\nmodules = [ { kind = \"notification\" } ]\n").unwrap();
+        assert_eq!(c.bar.right, vec![ModuleSpec::Notification]);
+        let e = parse("[bar.left]\nmodules = [ { kind = \"notification\" } ]\n\n[bar.right]\nmodules = [ { kind = \"notification\" } ]\n").unwrap_err();
+        assert!(e.starts_with("5:"), "the error points at the second entry: {e}");
     }
 
     #[test]

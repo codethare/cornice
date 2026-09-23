@@ -59,8 +59,8 @@ fi
 
 rm -rf "$W/run" "$W/cfg"; mkdir -p "$W/run" "$W/cfg/cornice"; chmod 700 "$W/run"
 cat > "$W/cfg/cornice/config.toml" <<'EOF'
-# The demo config: a slightly slower enter animation than the 220 ms default, so the morph out of the
-# right-hand bar component survives being sampled at ~14 fps.
+# The demo config: a slightly slower enter animation than the 220 ms default, so the stretch out of the
+# bar survives being sampled at ~14 fps.
 [bar]
 height   = 30
 margin   = 0
@@ -85,7 +85,7 @@ modules = [ { kind = "clock", format = "%H:%M" } ]
 modules = [ { kind = "exec", command = "echo cornice", format = "{out}" } ]
 
 [bar.right]
-modules = [ { kind = "exec", command = "echo 87%", format = "{out}" } ]
+modules = [ { kind = "exec", command = "echo 87%", format = "{out}" }, { kind = "notification" } ]
 EOF
 export XDG_RUNTIME_DIR=$W/run
 export WAYLAND_DISPLAY=wayland-1

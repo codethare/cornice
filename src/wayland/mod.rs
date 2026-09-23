@@ -28,9 +28,8 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::anim::Tween;
+use crate::anim::{Easing, Tween};
 use crate::geom::Rect;
-use crate::notify::queue::Notification;
 use crate::widget::Action;
 
 pub const LAYER_NAMESPACE: &str = "cornice";
@@ -73,10 +72,10 @@ pub struct NotifSurface {
 /// The geometric endpoints of the notification animation. Only one animation at a time (see `redraw_notifications`).
 #[derive(Clone)]
 enum AnimKind {
-    /// The new card grows out of the right cluster; `id` is the notification entering (it must still be at the head).
+    /// A new card stretches the column down; `id` is the notification entering (it must still be at the head).
     Enter(u32),
-    /// A closed/expired card shrinks back to the right cluster; the snapshot keeps content drawable during the leave.
-    Exit(Notification),
+    /// A closed/expired card retracts the column back into the bar, and the rows shift up with it.
+    Exit,
 }
 
 #[derive(Clone)]
@@ -227,7 +226,7 @@ impl State {
         let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some(LAYER_NAMESPACE), Some(&output));
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
         // The margin is vertical only (top): this keeps the horizontal coordinate systems of the bar and notification surface identical (both span the full width),
-        // the island's t=0 "aligned to the right cluster pixel" only holds then; a horizontal inset would break that premise, so it is deliberately unsupported.
+        // the stretch's column x/w come from the same `BarLayout` slot on both surfaces only then; a horizontal inset would break that premise, so it is deliberately unsupported.
         layer.set_margin(self.cfg.bar.margin, 0, 0, 0);
         // Design §3: exclusive_zone = bar height + 2×margin (a margin above and below).
         layer.set_exclusive_zone(self.bar_height as i32 + 2 * self.cfg.bar.margin);
@@ -263,7 +262,7 @@ impl State {
                 let _ = crate::notify::service::emit_closed(c, id, 1);
             }
         }
-        // Refresh the clock/bar layout first: the enter animation's island origin must follow the latest right cluster (the clock ticking moves it).
+        // Refresh the clock/bar layout first: the stretch's column follows the latest slot (the clock ticking moves the modules beside it).
         if self.sections.update(&crate::widget::Event::Wake) {
             self.redraw_all();
         }
@@ -319,34 +318,28 @@ impl State {
             .map(|b| (b.width.max(1)) as i32)
     }
 
-    /// Notification surface height: the gap below the bar plus max_visible cards (each estimated at up to 3 lines of text).
-    fn notif_surface_height(&self) -> u32 {
-        let line = (self.theme.font.size * 1.35).ceil() as i32;
-        // Worst-case height per card: summary 1 line + body up to MAX_BODY_LINES lines + actions 1 line.
-        // must be ≥ the true upper bound of card_size, or the bottom-most card gets clipped.
-        let lines_per_card = 1 + crate::notify::queue::MAX_BODY_LINES as i32 + 1;
-        let per_card = self.theme.card_padding * 2 + line * lines_per_card + self.theme.card_gap;
-        let n = self.cfg.notification.max_visible as i32;
-        // The head card hangs straight off the bar; only the gaps between cards are added.
-        let h = self.cfg.bar.margin + self.cfg.bar.height + n * per_card;
+    /// Notification surface height: the bar plus the worst-case tail of `max_visible` cards. It is sized once —
+    /// a resize per animation frame goes through a configure round-trip and would stutter the stretch.
+    fn notif_surface_height(&mut self) -> u32 {
+        let tail = crate::notify::view::max_tail(self.cfg.notification.max_visible, &self.theme, &mut self.text);
+        let h = self.cfg.bar.margin + self.cfg.bar.height + tail;
         h.max(1) as u32
     }
 
-    /// Compute the island origin (the bar's right cluster) and the static rects of the currently visible cards.
-    fn notif_geometry(&mut self, output_w: i32) -> (Rect, Vec<Rect>) {
-        let widths = self.sections.widths(&mut self.text, &self.theme);
-        let bar_layout = crate::bar::layout(&widths, output_w, &self.theme);
-        let island = crate::notify::view::island_start(&bar_layout, &self.theme);
-        let visible = self.queue.visible();
-        let mut sizes = Vec::with_capacity(visible.len());
-        for n in visible {
-            sizes.push(crate::notify::view::card_size(n, &mut self.text, &self.theme));
+    /// The stretched column for the current queue: the notification module's slot is where it hangs off the bar.
+    /// `None` when the module is not configured, which is what turns the notification cards off entirely.
+    fn notif_column(&mut self, output_w: i32) -> Option<crate::notify::view::Column> {
+        let at = self.sections.notif_at()?;
+        let w = crate::notify::view::slot_width(self.queue.visible(), &mut self.text, &self.theme);
+        if w != self.sections.notif_width() {
+            // The card's width is reserved in the bar, so the bar re-lays out with it.
+            self.sections.set_notif_width(w);
+            self.redraw_all();
         }
-        // The head card starts at the bar's bottom edge, not below a gap: that shared edge is what
-        // makes the card read as extruded from the bar instead of parked under it.
-        let top = self.theme.height;
-        let rects = crate::notify::view::card_rects(visible.len(), &sizes, output_w, &self.theme, top);
-        (island, rects)
+        let widths = self.sections.widths(&mut self.text, &self.theme);
+        let bar = crate::bar::layout(&widths, output_w, &self.theme);
+        let slot = bar.slot(at)?;
+        Some(crate::notify::view::column(self.queue.visible(), slot.x, slot.w, output_w, &self.theme, &mut self.text))
     }
 
     /// Make sure the notification surface exists while the queue is non-empty or a leave animation is running.
@@ -378,51 +371,58 @@ impl State {
     /// Start the enter animation (the id must be the one just inserted at the head).
     fn start_enter(&mut self, id: u32, now: Instant) {
         let Some(output_w) = self.notif_output_width() else { return };
-        let (island, rects) = self.notif_geometry(output_w);
-        let Some(end) = rects.first().copied() else { return };
+        let Some(column) = self.notif_column(output_w) else { return };
+        // t=0 is the bar's own row: nothing has been stretched below it yet.
+        let start = Rect::new(column.rect.x, 0, column.rect.w, self.theme.height);
         self.set_anim(Some(Anim {
             kind: AnimKind::Enter(id),
             tween: Tween::new(now, self.cfg.notification.enter_ms),
-            start: island,
-            end,
+            start,
+            end: column.rect,
         }));
+    }
+
+    /// Remove an entry that is not on screen and emit its close signal: there is nothing to animate.
+    fn drop_silently(&mut self, id: u32, reason: u32) {
+        if self.queue.remove(id).is_some() {
+            if let Some(c) = &self.dbus {
+                let _ = crate::notify::service::emit_closed(c, id, reason);
+            }
+        }
     }
 
     /// Close one notification and emit the signal; if it is on screen, play the leave animation.
     fn close_visible(&mut self, id: u32, reason: u32, now: Instant) {
-        let Some(output_w) = self.notif_output_width() else {
-            // No bar yet: remove and signal directly, no animation.
-            if self.queue.remove(id).is_some() {
-                if let Some(c) = &self.dbus {
-                    let _ = crate::notify::service::emit_closed(c, id, reason);
-                }
-            }
-            return;
+        // No bar, no notification module, or an entry outside the visible window: no animation.
+        let Some(output_w) = self.notif_output_width().filter(|_| self.sections.notif_at().is_some()) else {
+            return self.drop_silently(id, reason);
         };
-        let (island, rects) = self.notif_geometry(output_w);
-        let Some(idx) = self.queue.visible().iter().position(|n| n.id == id) else {
-            // Outside the visible window → remove and signal directly, no animation.
-            if self.queue.remove(id).is_some() {
-                if let Some(c) = &self.dbus {
-                    let _ = crate::notify::service::emit_closed(c, id, reason);
-                }
-            }
+        if !self.queue.visible().iter().any(|n| n.id == id) {
+            return self.drop_silently(id, reason);
+        }
+        let Some(column) = self.notif_column(output_w) else { return self.drop_silently(id, reason) };
+        let start = column.rect;
+        // The card leaves the queue right away: the remaining rows shift up and the shape retracts over them.
+        if self.queue.remove(id).is_none() {
             return;
-        };
-        let start = rects.get(idx).copied().unwrap_or(island);
-        let Some(snapshot) = self.queue.remove(id) else { return };
+        }
+        // An empty queue has no column left to aim at, so the shape keeps its width and only drops its tail.
+        let end = self
+            .notif_column(output_w)
+            .filter(|_| !self.queue.is_empty())
+            .map_or(Rect::new(start.x, 0, start.w, self.theme.height), |c| c.rect);
         self.set_anim(Some(Anim {
-            kind: AnimKind::Exit(snapshot),
+            kind: AnimKind::Exit,
             tween: Tween::new(now, self.cfg.notification.exit_ms),
             start,
-            end: island,
+            end,
         }));
         if let Some(c) = &self.dbus {
             let _ = crate::notify::service::emit_closed(c, id, reason);
         }
     }
 
-    /// Redraw the notification surface: lifetime, animation stepping, card drawing and input region in one pass.
+    /// Redraw the notification surface: lifetime, animation stepping, the stretch and the input region in one pass.
     fn redraw_notifications(&mut self, now: Instant) {
         // 1. Finish animations: done, or the Enter id is no longer at the head (displaced/closed).
         let mut drop_anim = false;
@@ -439,31 +439,61 @@ impl State {
             self.set_anim(None);
         }
 
-        // 2. Queue empty and no leave animation → destroy the surface.
-        let exit_in_flight = matches!(&self.anim, Some(a) if matches!(a.kind, AnimKind::Exit(_)));
-        if self.queue.is_empty() && !exit_in_flight {
+        // 2. No notification module configured: the stretch has nowhere to hang off the bar, so nothing is drawn
+        // (the D-Bus daemon still runs and the queue still expires).
+        if self.sections.notif_at().is_none() {
             if self.notif.is_some() {
                 self.destroy_notif_surface();
+                self.sections.set_notif_width(0);
+                self.redraw_all();
             }
             return;
         }
 
-        // 3. Make sure the surface exists.
+        // 3. Queue empty and no leave animation → destroy the surface; the bar takes its space back.
+        let exit_in_flight = matches!(&self.anim, Some(a) if matches!(a.kind, AnimKind::Exit));
+        if self.queue.is_empty() && !exit_in_flight {
+            if self.notif.is_some() {
+                self.destroy_notif_surface();
+            }
+            if self.sections.notif_width() != 0 {
+                self.sections.set_notif_width(0);
+                self.redraw_all();
+            }
+            return;
+        }
+
+        // 4. Make sure the surface exists.
         self.ensure_notif_surface();
         let Some(output_w) = self.notif_output_width() else { return };
 
-        // 4. Geometry (independent of whether the surface is configured; uses the bar width).
-        let (island, rects) = self.notif_geometry(output_w);
-        // The enter animation's origin must follow the latest bar layout (the clock ticking / a bar width change moves the right cluster).
-        // A leave animation's start is the slot at the moment of closing and must not drift with re-layout, so only Enter is changed here.
+        // 5. Geometry (independent of whether the surface is configured; uses the bar width).
+        let Some(column) = self.notif_column(output_w) else { return };
+        // The enter's endpoint follows the latest layout: a module that grows beside the card widens the slot.
         if let Some(anim) = self.anim.as_mut() {
             if matches!(&anim.kind, AnimKind::Enter(_)) {
-                anim.start = island;
+                anim.start = Rect::new(column.rect.x, 0, column.rect.w, self.theme.height);
+                anim.end = column.rect;
             }
         }
-        let visible = self.queue.visible();
+        // The shape this frame: the tween's interpolation, or the laid-out column when nothing is animating.
+        let shape = match &self.anim {
+            Some(a) => match a.kind {
+                AnimKind::Enter(_) => crate::notify::view::stretch(a.start, a.end, Easing::OutCubic, &a.tween, now),
+                AnimKind::Exit => crate::notify::view::stretch(a.start, a.end, Easing::InOutCubic, &a.tween, now),
+            },
+            None => column.rect,
+        };
+        // The text fades in only on the enter; a retracting column keeps its rows readable while it shrinks.
+        let alpha = match &self.anim {
+            Some(a) if matches!(a.kind, AnimKind::Enter(_)) => {
+                let t = a.tween.progress(now);
+                ((t - 0.35) / 0.65).clamp(0.0, 1.0)
+            }
+            _ => 1.0,
+        };
 
-        // 5. Draw.
+        // 6. Draw.
         let Some(notif) = self.notif.as_mut() else { return };
         if notif.width == 0 {
             return; // wait for the configure callback
@@ -473,48 +503,22 @@ impl State {
         let (buffer, canvas) = notif.pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).expect("failed to create the notification buffer");
         let mut c = crate::canvas::Canvas::new(canvas, w, h);
         c.clear();
+        let shape = shape.intersect(Rect::new(0, 0, w, h));
+        crate::notify::view::render_column(&mut c, shape, self.theme.height, shape, &self.theme);
+        c.set_clip(Some(shape));
 
         let mut hits: Vec<(Rect, Action)> = Vec::new();
-
-        // Enter animation: the head card grows out of the island.
-        let mut enter: Option<(Rect, f32)> = None;
-        if let Some(anim) = &self.anim {
-            if let AnimKind::Enter(id) = anim.kind {
-                if visible.first().is_some_and(|n| n.id == id) {
-                    let t = anim.tween.progress(now);
-                    let rect = crate::notify::view::island_enter_rect(anim.start, anim.end, &anim.tween, now);
-                    let alpha = ((t - 0.35) / 0.65).clamp(0.0, 1.0);
-                    enter = Some((rect, alpha));
-                }
+        for (i, n) in self.queue.visible().iter().enumerate() {
+            let Some(card) = column.cards.get(i) else { break };
+            let band = card.band.intersect(shape);
+            if band.is_empty() {
+                continue;
             }
-        }
-
-        for (i, n) in visible.iter().enumerate() {
-            let static_rect = *rects.get(i).unwrap_or(&island);
-            let (rect, alpha) = if i == 0 {
-                if let Some((r, a)) = enter { (r, a) } else { (static_rect, 1.0) }
-            } else {
-                (static_rect, 1.0)
-            };
-            if rect.bottom() > h {
-                break; // defensive: the capacity estimate should already keep this in bounds
-            }
-            let mut card_hits = crate::notify::view::render(&mut c, rect, self.theme.radius, alpha, n, &self.theme, &mut self.text);
+            let mut card_hits = crate::notify::view::render(&mut c, card, alpha, n, &self.theme, &mut self.text);
             hits.append(&mut card_hits); // buttons first
-            hits.push((rect, Action::NotificationClose(n.id))); // card body after
+            hits.push((band, Action::NotificationClose(n.id))); // card body after
         }
-
-        // Leave animation: the closed card shrinks back (its content is gone from the queue, so a snapshot is drawn).
-        if let Some(anim) = &self.anim {
-            if let AnimKind::Exit(snapshot) = &anim.kind {
-                let rect = crate::notify::view::island_exit_rect(anim.start, anim.end, &anim.tween, now);
-                if rect.bottom() <= h {
-                    let mut card_hits = crate::notify::view::render(&mut c, rect, self.theme.radius, 1.0, snapshot, &self.theme, &mut self.text);
-                    hits.append(&mut card_hits);
-                    hits.push((rect, Action::NotificationClose(snapshot.id)));
-                }
-            }
-        }
+        c.set_clip(None);
 
         // Input region: always Some (an empty region responds to nothing; None makes the whole surface swallow clicks).
         let region = Region::new(&self.compositor).expect("failed to create the input region");
@@ -534,6 +538,9 @@ impl State {
 
     fn redraw(&mut self, output: &wl_output::WlOutput) {
         let qh = self.qh.clone();
+        // The bar reserves the current card width for the notification module before it is laid out.
+        let card_w = crate::notify::view::slot_width(self.queue.visible(), &mut self.text, &self.theme);
+        self.sections.set_notif_width(card_w);
         let theme = &self.theme;
         let text = &mut self.text;
         let sections = &mut self.sections;

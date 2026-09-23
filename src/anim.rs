@@ -1,4 +1,4 @@
-//! Easing and tweening. There is exactly one animation (the notification island entering and leaving), so there is no general keyframe system.
+//! Easing and tweening. There is exactly one animation (the notification stretch entering and leaving), so there is no general keyframe system.
 
 use std::time::{Duration, Instant};
 

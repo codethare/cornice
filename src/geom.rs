@@ -9,13 +9,14 @@ impl Rect {
     pub const fn right(&self) -> i32 { self.x + self.w }
     pub const fn bottom(&self) -> i32 { self.y + self.h }
     pub const fn is_empty(&self) -> bool { self.w <= 0 || self.h <= 0 }
+    /// Overlap of two rects; an empty rect when they do not touch.
+    pub fn intersect(&self, o: Rect) -> Rect {
+        let x = self.x.max(o.x);
+        let y = self.y.max(o.y);
+        Rect::new(x, y, self.right().min(o.right()) - x, self.bottom().min(o.bottom()) - y)
+    }
     pub const fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
-    }
-    /// Linear interpolation between a and b (each component rounded).
-    pub fn lerp(a: Rect, b: Rect, t: f32) -> Rect {
-        let l = |x: i32, y: i32| x + ((y - x) as f32 * t).round() as i32;
-        Rect::new(l(a.x, b.x), l(a.y, b.y), l(a.w, b.w), l(a.h, b.h))
     }
 }
 
@@ -96,12 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn rect_lerp_endpoints_and_midpoint() {
+    fn rect_intersect() {
         let a = Rect::new(0, 0, 10, 10);
-        let b = Rect::new(100, 50, 200, 30);
-        assert_eq!(Rect::lerp(a, b, 0.0), a);
-        assert_eq!(Rect::lerp(a, b, 1.0), b);
-        let mid = Rect::lerp(a, b, 0.5);
-        assert_eq!(mid.x, 50);
+        assert_eq!(a.intersect(Rect::new(5, 5, 10, 10)), Rect::new(5, 5, 5, 5));
+        assert_eq!(a.intersect(Rect::new(2, 2, 1, 1)), Rect::new(2, 2, 1, 1));
+        assert!(a.intersect(Rect::new(20, 0, 5, 5)).is_empty(), "disjoint rects give an empty rect");
+        assert_eq!(a.intersect(a), a);
     }
 }

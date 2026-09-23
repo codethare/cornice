@@ -79,7 +79,7 @@ D-Bus 线程 (zbus blocking, org.freedesktop.Notifications)
 | 栏 | `Top` | top + left + right | 常驻,每 output 一个,`exclusive_zone = 栏高 + 2×margin` |
 | 通知 | `Overlay` | top + left + right,`margin_top = bar.margin` | 队列非空时创建,清空后销毁 |
 
-通知 surface 是全宽透明大块(高度 = 栏高 + 卡片区),所有卡片绘制在同一个 buffer 内。每帧调用 `set_input_region` 设为其可见形状的并集,因此透明区域对指针完全穿透。它铺在栏之上(`Overlay` > `Top`),这是"从右侧组件长出来"成立的前提:t=0 时岛的矩形与栏右簇的矩形像素重合。
+通知 surface 是全宽透明大块(高度 = 栏高 + 最大卡片区),所有卡片绘制在同一个 buffer 内。每帧调用 `set_input_region` 设为其可见形状的并集,因此透明区域对指针完全穿透。它铺在栏之上(`Overlay` > `Top`),这是拉伸成立的前提:列的 y=0 与栏的 y=0 是同一条线,列与栏重叠的部分不画底色。
 
 ### 渲染栈
 
@@ -117,12 +117,13 @@ modules = []
 modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
   { kind = "exec", command = "while true; do awk '{print int($1/1024)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
+  { kind = "notification" },   # 通知卡片画在这里(只能配一个)
 ]
 
 [notification]
 max_visible = 4     # 超出者保留在队列中不绘制
-enter_ms    = 220   # 进场(岛 → 卡片)
-exit_ms     = 160   # 退场(卡片 → 岛)
+enter_ms    = 220   # 拉伸(栏 → 整列)
+exit_ms     = 160   # 收回(整列 → 栏)
 ```
 
 三块各自是一个**有序模块列表**,这就是"自由搭配"的全部含义:没有嵌套容器,没有布局语言。换顺序即换顺序,关掉即删掉。
@@ -135,8 +136,11 @@ exit_ms     = 160   # 退场(卡片 → 岛)
 |---|---|---|
 | `clock` | 本地时间 | `format`(chrono 格式串) |
 | `exec` | 长驻子进程 stdout,一行一次更新;进程退出后 1s 重启 | `command`、`format`(含 `{out}`) |
+| `notification` | 进程内的通知守护进程队列 | 无(行为由 `[notification]` 配置) |
 
-只有两种,而且是刻意的:现代 river 上第三方 bar 拿不到 WM 状态(§2),系统信息(CPU/内存/电量)本来就该由脚本产出,这也正是最初需求里说的"支持由外部的脚本来显示 CPU/mem/battery"。
+`notification` 不产出文字:它只标记"通知卡片挂在这里",并在栏里占据当前最宽卡片的宽度,所以相邻模块不会被卡片压住。它只能出现在三个区域中的一个,**只能配一次** —— 一块材质只能从一个地方拉出来。未配置它时通知不绘制(D-Bus 守护进程照常运行)。
+
+除这三种之外的就是刻意的:现代 river 上第三方 bar 拿不到 WM 状态(§2),系统信息(CPU/内存/电量)本来就该由脚本产出,这也正是最初需求里说的"支持由外部的脚本来显示 CPU/mem/battery"。
 
 `exec` 采用长驻流式(而非定时轮询):轮询类需求由脚本自己写循环表达(`while true; do …; sleep 5; done`),bar 端因此不需要 interval 机制与进程 spawn 调度。
 
@@ -162,6 +166,7 @@ trait Module {
 
 - left 靠左排,right 靠右排,center 以**屏幕中线**居中(不是以剩余空间居中)。
 - 三者重叠时 center 优先,两侧模块按需省略号截断。
+- 宽 0 的模块(队列为空的通知模块)既不占宽也不占模块间距,所以它的存在不影响栏的样子。
 - 规则写进文档,保证可预测:不会因为文字变长而抖动。
 
 ### 光学校正(2026-09-22 修正)
@@ -190,35 +195,43 @@ trait Module {
 - **队列**:按新→旧排序,`max_visible` 之外的不绘制但保留,前方消失后依次滑入;溢出丢弃最旧。
 - **关闭原因**:1 = 超时,2 = 用户关闭,3 = `CloseNotification`。
 
+**放置**:卡片画在 `notification` 模块所在的位置。该模块在栏布局里占一个槽位,宽度 = 当前可见卡片中最宽的一张(content 派生,`MIN_CARD_W=80` .. `MAX_CARD_W=420`);队列为空时宽 0。模块只能配一个,未配置则不绘制卡片。
+
 ### 输入
 
-左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点按钮 = `ActionInvoked` + 关闭。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
+左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点按钮 = `ActionInvoked` + 关闭。栏内那一行文字也是卡片的一部分,点它也关闭卡片。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
 
 ### 降级
 
 若 `org.freedesktop.Notifications` 已被其他守护进程占用,栏照常运行,打印警告,仅通知功能不可用 —— 不退出。
 
-## 7. 岛屿形变
+## 7. 拉伸(stretch)
 
-单条 tween,插值对象只有四项:x、w、h、文字 alpha(底色全程为栏底色,不淡入)。
+通知卡片由 overlay surface 绘制(栏 surface 只有 `height` 高,画不出栏下方),但它画的是**栏自身的材质**:列矩形从 y=0(栏顶)开始,与栏重叠的部分**不画底色** —— `theme.background` 是半透明的(`#1a1a1aee`),同一块地方画两遍会把重叠区压暗,那就正好看起来像贴在栏下面而不是从栏里拉出来。只有栏底边以下填色,底角圆角,顶边被栏底边切齐:没有缝,也没有凹口。
+
+单条 tween,插值对象只有 h 与文字 alpha(y 恒为 0,x/w 跟随当前布局,不插值)。
 
 ```
-t=0   rect = (右簇 x/w, y = 栏底边, h = 0)        → 高 0,视觉上“不存在”
-t=1   rect = 右上角最终卡片位置(含卡片圆角与高度)
+t=0   rect = (槽位 x/w, y = 0, h = 栏高)   → 与栏自身像素完全重合,视觉上什么都没拉出来
+t=1   rect = 整列(顶到栏顶,底到最后一行 + card_padding)
 ```
 
-- **进场在栏底边上原地长出来,不是从右簇飞过去**:y 全程锁定为栏底边(`bar.height`),h 由 0 长到卡片高度,x/w 由右簇插值到卡片。这样每一帧的形状都“挂”在栏的同一条边上,连接处是卡片圆角肩与栏底边的相切(平滑喇叭口),像一块粘土从栏里被拉出来;飞行式的插值会出现一个直边的方块从栏里滑出来。
-- 文字立刻按最终矩形排版,但裁剪到卡片矩形内,alpha = `clamp((t - 0.35) / 0.65)`。因为 y 不动,文字只在淡入,不跟着滑 —— 这就是“胶囊张开成盒子,字随后浮出”。
-- 退场是整条 tween 的反向(rect 四分量插值回右簇),160ms。
+- **向下拉伸,不是飞进来**:y 全程为 0,x/w 跟随当前布局(旁边的模块变宽时列跟着走),只有 h 由栏高长到整列高。每一帧形状都挂在栏的底边上,所以看起来是栏被拉长;飞行式的插值会出现一个直边方块从栏里滑出来。
+- 文字立即按最终矩形排版,但裁剪到当前形状内,alpha = `clamp((t - 0.35) / 0.65)`。因为 y 不动,文字只在淡入,不跟着滑。
+- 退场是同一 tween 的反向,160ms:形状向上收回栏内。退场不画已关闭卡片的残影 —— 行随队列立即上移,形状随后收回。
 - 进场 220ms ease-out-cubic;两者缺省值可在 `[notification]` 覆盖。
 - 动画期间栏 surface 完全不重绘,只有 overlay surface 在动。
 - 静止时不 arm 帧定时器,零唤醒。
 
-**关键耦合**:进场起点 (x, w) 必须严格等于右区块全部模块(含模块间距)的整体矩形外扩 `bar.padding`(右边缘到屏幕边,即与栏胶囊右端像素重合),终点 y 必须是 `bar.height`。因此栏的布局结果(`BarLayout` 快照)就是通知模块的输入 —— 同一份数据,不重算。
+**挂接点**:列的水平范围必须落在栏底边的直线段内,即 `[radius, output_w - radius]`;模块槽位超出这个范围时按此裁切。栏两端是圆角,那里没有直线底边,方角顶面挂在那里会留下一个凹口 —— 那正是“背景与栏分离”。
 
-**卡片堆叠**:首卡 y = `bar.height`(与栏底边重合,不留 `card_gap`),后续卡片依次向下留 `card_gap`。首卡因此是唯一与栏相连的那张 —— 这正是“从右侧栏组件伸出来”的形状。
+**关键耦合**:列的 x/w 来自 `BarLayout` 里 `notification` 模块所占的槽位矩形,宽 = 当前可见卡片里最宽的一张(`notify::view::slot_width`)。队列为空时宽 0,且**0 宽模块不占模块间距**,所以没有卡片时栏的其余模块不会移位。栏的布局结果就是通知模块的输入 —— 同一份数据,不重算。
 
-**退化情况**:未配置右侧模块时,起点是右边缘一条 `padding` 宽的缝,卡片仍从中向下长出。
+**首卡在栏里**:首卡(最新)的 summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);只有放不下的行才向下拉伸。因此一条短通知整个都在栏里,栏下方什么都不画。
+
+**卡片堆叠**:后续卡片在**同一块**背景里按 `card_gap` 依次向下排,所以第二张到达就是“继续向下拉”,两张之间不会露出壁纸,一直到最后一张的 `card_padding` 才结束。关闭其中任意一张时,剩余的行立即上移,形状随后收回。
+
+**退化情况**:未配置 `notification` 模块时不绘制卡片(守护进程照常运行);队列为空时不创建 overlay surface。
 
 **多显示器**:通知投给当前 focus 的 output,使用该 output 的栏矩形。
 
@@ -239,7 +252,7 @@ src/bar/mod.rs                    栏 surface、左中右布局、BarLayout 快�
 src/bar/modules.rs                clock / exec
 src/notify/queue.rs               通知队列状态机(纯逻辑)
 src/notify/service.rs             zbus 线程 + D-Bus 方法
-src/notify/view.rs                卡片排版 + 岛屿 tween + 命中
+src/notify/view.rs                列几何 + 拉伸 tween + 命中
 docs/smoke.md                     手动验证清单
 ```
 
@@ -272,7 +285,7 @@ docs/smoke.md                     手动验证清单
 6. `anim`(easing / Tween)
 7. 通知服务:D-Bus + 队列状态机
 8. 通知视图:静态卡片 + 输入命中
-9. 岛屿 tween 接线 + `max_visible` + `docs/smoke.md`
+9. 拉伸 tween 接线 + `max_visible` + `docs/smoke.md`
 
 ## 11. 风险
 

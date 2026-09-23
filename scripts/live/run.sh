@@ -115,7 +115,7 @@ modules = [ { kind = "clock", format = "%H:%M" } ]
 modules = [ { kind = "exec", command = "echo mid", format = "{out}" } ]
 
 [bar.right]
-modules = [ { kind = "exec", command = "echo 42", format = "L{out}" } ]
+modules = [ { kind = "exec", command = "echo 42", format = "L{out}" }, { kind = "notification" } ]
 EOF
     XDG_RUNTIME_DIR=$W/run WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=$n WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
         setsid "$RIVER_BIN" -c "$TAILRACE_BIN" -log-level debug >"$W/river.log" 2>&1 </dev/null &
@@ -233,54 +233,74 @@ eq $GAP "$wx0" "window left edge == tailrace horizontal_gap ($GAP)"
 eq $((BAR_H + GAP)) "$wy0" "window top edge == bar height + gap (exclusive zone reached the WM)"
 ge 100000 "$wcount" "window is actually rendered"
 
-sec "notifications: card, timeout, urgency"
-bands() { px bands "$W/$1.ppm" "$((OUT_W - 12))" $((BAR_H + 1)) "$OUT_H"; }
+sec "notifications: card in the bar, stretch, timeout, urgency"
+# The probe toplevel from the section above would fill everything below the bar with green, so the card's own
+# pixels could not be measured: stop it here, and start a fresh one for the click-through check.
+stop_tree "${win_bg:-}"; win_bg=
+bands() { px bands "$W/$1.ppm" "$((OUT_W - 20))" $((BAR_H + 1)) "$OUT_H"; }
 close_all
-n1=$(notify cornice-test 0 "" "Hello" "Live test body" "[]" "{}" -1)
+read -r _ _ _ _ bar_ink < <(px near "$W/bar.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
+
+# "The first card is shown in the bar": a card whose rows fit lives entirely inside it.
+n1=$(notify cornice-test 0 "" "Short summary" "" "[]" "{}" 0)
 sleep 1.8
-shot nt1
-read -r _ ny0 _ _ ncount < <(card_region "$W/nt1.ppm")
-ge 1 "$ncount" "a Notify maps a card"
-eq $BAR_H "$ny0" "card hangs off the bar's bottom edge (bar + gap is gone)"
-# The card's own edges, read below the junction so the fillets do not widen the bbox.
-read -r nx0 _ nx1 _ _ < <(region "$W/nt1.ppm" 900 $((BAR_H + 10)) "$OUT_W" $((BAR_H + 40)))
-eq 1271 "$nx1" "card is right aligned (output_w - padding) (card is ${nx0}..${nx1})"
-# The join: the card's rounded shoulder is tangent to the bar's bottom edge, so the two are one
-# silhouette -- no gap anywhere. A column inside the card must be one unbroken run from the bar down.
-read -r cb _ _ _ _ < <(region "$W/nt1.ppm" 900 $BAR_H "$OUT_W" 300)
-eq 1 "$(px bands "$W/nt1.ppm" $((nx0 + 30)) 0 $((cb + 1)))" "the card is one piece with the bar (unbroken column)"
-eq 1 "$(px bands "$W/nt1.ppm" $((nx1 - 30)) 0 $((cb + 1)))" "...on both shoulders"
-eq 1 "$(bands nt1)" "exactly one card on screen"
+shot short
+read -r _ _ _ _ short_ink < <(px near "$W/short.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
+ge $((bar_ink + 20)) "$short_ink" "the first card's summary is drawn inside the bar ($bar_ink -> $short_ink ink px)"
+read -r _ _ _ _ short_below < <(card_region "$W/short.ppm")
+eq 0 "$short_below" "a card that fits in the bar paints nothing below it"
+close_all
+
+# "If it is too long, it stretches downwards", and the background stays one piece with the bar.
+n2=$(notify cornice-test 0 "" "Long" $'one\ntwo\nthree' "[]" "{}" 0)
+sleep 1.8
+shot long
+read -r long_x0 _ long_x1 long_y1 long_count < <(card_region "$W/long.ppm")
+ge 1 "$long_count" "a body that does not fit in the bar stretches the card below it"
+ge $((BAR_H + 20)) "$long_y1" "…down to the last body row ($long_y1)"
+# The stretch attaches to the straight part of the pill's bottom edge: radius (15) in from the right end.
+# (bbox max x is right()-1, so the expected value is output_w - radius - 1.)
+eq $((OUT_W - 16)) "$long_x1" "the stretch stops where the pill's bottom edge starts to curve (${long_x0}..${long_x1})"
+eq 1 "$(px bands "$W/long.ppm" $((long_x1 - 20)) 0 $((long_y1 + 1)))" "the bar and the stretched card are one unbroken piece"
+
+# "A second notification keeps stretching downwards": both cards share one background.
+n3=$(notify cornice-test 0 "" "Second" "also here" "[]" "{}" 0)
+sleep 1.8
+shot two
+read -r _ _ _ two_y1 _ < <(card_region "$W/two.ppm")
+ge $((long_y1 + 20)) "$two_y1" "a second card keeps stretching downwards ($long_y1 -> $two_y1)"
+eq 1 "$(px bands "$W/two.ppm" $((long_x1 - 20)) 0 $((two_y1 + 1)))" "the two cards keep one unbroken background"
 close_all
 shot nt0
 eq 0 "$(bands nt0)" "CloseNotification removes the card"
 
-n2=$(notify cornice-test 0 "" "Fades" "gone in 1.5s" "[]" "{}" 1500)
+n4=$(notify cornice-test 0 "" "Fades" "gone in 1.5s" "[]" "{}" 1500)
 sleep 0.6
 shot nt2a
 eq 1 "$(bands nt2a)" "expire_timeout=1500 card is visible at first"
 sleep 1.6
 shot nt2b
 eq 0 "$(bands nt2b)" "…and is gone 2.2 s later"
-eq 1 "$(closed_pairs | grep -c "^$n2 1$")" "expiry emits NotificationClosed(id=$n2, reason=1)"
+eq 1 "$(closed_pairs | grep -c "^$n4 1$")" "expiry emits NotificationClosed(id=$n4, reason=1)"
 
-n3=$(notify cornice-test 0 "" "Critical" "stays" "[]" "{'urgency': <byte 2>}" -1)
+n5=$(notify cornice-test 0 "" "Critical" "stays" "[]" "{'urgency': <byte 2>}" -1)
 sleep 2.5
 shot nt3
 eq 1 "$(bands nt3)" "critical urgency does not auto-dismiss (default timeout)"
 close_all
 
 sec "replace in place does not replay the enter animation"
-# With enter_ms = 1500 a *new* id is still visibly growing after 500 ms, so a replayed
-# animation after a replace would be caught; the card's bottom edge is content independent.
-# head slot band only, ending before a possible second card (which now starts ~7px higher than it used to)
-slot0() { region "$1" 900 $((BAR_H + 1)) 1280 $((BAR_H + 51)); }
-n4=$(notify cornice-test 0 "" "Replace" "me" "[]" "{}" 0)
+# With enter_ms = 1500 a *new* id is still visibly stretching after 500 ms, so a replayed animation after a
+# replace would be caught. Both bodies are five lines long, so the final shape is the same height either way,
+# and the measurement covers the whole column below the bar.
+slot0() { region "$1" 900 $((BAR_H + 1)) 1280 300; }
+body5=$'a\nb\nc\nd\ne'
+n6=$(notify cornice-test 0 "" "Replace" "$body5" "[]" "{}" 0)
 sleep 1.8
 shot steady
 read -r sx0 sy0 _ sy1 _ < <(slot0 "$W/steady.ppm")
 
-n5=$(notify cornice-test 0 "" "Fresh" "new card" "[]" "{}" 0)
+n7=$(notify cornice-test 0 "" "Fresh" "$body5" "[]" "{}" 0)
 sleep 0.5
 shot fresh
 read -r _ _ _ fy1 _ < <(slot0 "$W/fresh.ppm")
@@ -288,17 +308,18 @@ sleep 1.5
 shot fresh_done
 read -r _ _ _ fy1_done _ < <(slot0 "$W/fresh_done.ppm")
 
-notify cornice-test "$n4" "" "Replace" "updated body" "[]" "{}" 0 >/dev/null
+# Same shape, different text: a replace must not re-run the stretch.
+notify cornice-test "$n7" "" "Fresh" $'v\nw\nx\ny\nz' "[]" "{}" 0 >/dev/null
 sleep 0.5
 shot replaced
-read -r rx0 _ _ ry1 _ < <(slot0 "$W/replaced.ppm")
+read -r _ _ _ ry1 _ < <(slot0 "$W/replaced.ppm")
 sleep 1.5
 shot replaced_done
 read -r _ _ _ ry1_done _ < <(slot0 "$W/replaced_done.ppm")
 
-echo "  (head card bottom edge: steady ${sy1}, new id +500 ms ${fy1} -> ${fy1_done}, replace +500 ms ${ry1} -> ${ry1_done})"
+echo "  (column bottom edge: steady ${sy1}, new id +500 ms ${fy1} -> ${fy1_done}, replace +500 ms ${ry1} -> ${ry1_done})"
 if [ "$fy1" -lt $((fy1_done - 10)) ]; then
-    ok "control: a new id is still mid-animation after 500 ms (bottom $fy1 vs final $fy1_done)"
+    ok "control: a new id is still stretching after 500 ms (bottom $fy1 vs final $fy1_done)"
     if [ "$ry1" -ge $((ry1_done - 3)) ]; then
         ok "a replace is already at its final rect after 500 ms — the enter animation was not replayed"
     else
@@ -307,10 +328,22 @@ if [ "$fy1" -lt $((fy1_done - 10)) ]; then
 else
     note "control shot was too late to observe the animation (bottom $fy1 vs final $fy1_done), replace not judged"
 fi
-eq 0 "$(closed_pairs | grep -c "^$n5 ")" "a new id emits no NotificationClosed"
+eq 0 "$(closed_pairs | grep -c "^$n7 ")" "a new id emits no NotificationClosed"
 close_all
 
 sec "queue: max_visible caps the stack"
+close_all
+# One card, then two: the per-card step is measured rather than assumed, because a card's height comes from the
+# font metrics (cap height, line advance) and not from a constant in this script.
+notify cornice-test 0 "" "Card 1" "body 1" "[]" "{}" 0 >/dev/null
+sleep 1.8
+shot q1
+read -r _ _ _ q1y _ < <(card_region "$W/q1.ppm")
+notify cornice-test 0 "" "Card 2" "body 2" "[]" "{}" 0 >/dev/null
+sleep 1.8
+shot q2
+read -r _ _ _ q2y _ < <(card_region "$W/q2.ppm")
+step=$(( q2y - q1y ))
 close_all
 ids=""
 for i in 1 2 3 4 5 6; do
@@ -319,14 +352,14 @@ for i in 1 2 3 4 5 6; do
 done
 sleep 1.8
 shot stack
-read -r bands < <(px bands "$W/stack.ppm" "$((OUT_W - 12))" $((BAR_H + 1)) "$OUT_H")
-eq 4 "$bands" "6 notifications leave exactly max_visible=4 cards on screen"
+read -r _ _ _ stack_y1 _ < <(card_region "$W/stack.ppm")
+eq $(( q1y + 3 * step )) "$stack_y1" "6 notifications leave exactly max_visible=4 cards stacked (${step}px per card)"
 first=$(echo $ids | awk '{print $1}')
 close_id "$first"
 sleep 0.8
 shot stack2
-read -r bands2 < <(px bands "$W/stack2.ppm" "$((OUT_W - 12))" $((BAR_H + 1)) "$OUT_H")
-eq 4 "$bands2" "a hidden card slides in when a visible one closes"
+read -r _ _ _ stack2_y1 _ < <(card_region "$W/stack2.ppm")
+eq "$stack_y1" "$stack2_y1" "a hidden card slides in when a visible one closes"
 last=$(echo $ids | awk '{print $NF}')
 if closed_pairs | grep -q "^$last "; then bad "an overflowed (never visible) card emitted NotificationClosed"; else ok "an overflowed card emits nothing"; fi
 close_all
@@ -337,7 +370,7 @@ na=$(notify cornice-test 0 "" "Clickable" "click me" "[]" "{}" 0)
 sleep 1.8
 shot click
 read -r cx0 cy0 cx1 cy1 _ < <(card_region "$W/click.ppm")
-vp at $((cx0 + 30)) $((cy0 + 20))
+vp at $((cx0 + 20)) $((cy0 + 8))
 vp click left
 sleep 0.8
 if closed_pairs | grep -q "^$na 2$"; then
@@ -369,6 +402,10 @@ fi
 
 nc=$(notify cornice-test 0 "" "Passthrough" "transparent around me" "[]" "{}" 0)
 sleep 1.8
+# A fresh toplevel: the one from the exclusive-zone section was stopped so the card could be measured.
+setsid env PROBE_COLOR=00ff00 "$PROBE" win >"$W/win.log" 2>&1 </dev/null &
+win_bg=$!
+sleep 1.5
 p0=$(grep -c 'win: pointer button' "$W/win.log")
 # (100,100) is inside the notification surface's full-width band but outside every card,
 # and inside the probe toplevel: the click must reach the toplevel, not cornice.
