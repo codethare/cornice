@@ -69,15 +69,18 @@ impl<'a> Canvas<'a> {
             return self.fill_rect(rect, color);
         }
         // Judged by the distance from the pixel centre to the nearest corner centre; coordinates are clamped into the inner rect,
-        // Outside the corner regions dx/dy are naturally 0, so no extra branch is needed.
+        // Outside the corner regions dx/dy are naturally 0, so no extra branch is needed. The corner itself is a
+        // continuous (squircle) corner — see `CORNER_EXPONENT` — not a circular arc.
         let rf = r as f32;
+        let n = crate::geom::CORNER_EXPONENT;
         let inside = |x: i32, y: i32| -> bool {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
             let cx = px.clamp(rect.x as f32 + rf, rect.right() as f32 - rf);
             let cy = py.clamp(rect.y as f32 + rf, rect.bottom() as f32 - rf);
-            let (dx, dy) = (px - cx, py - cy);
-            dx * dx + dy * dy <= rf * rf
+            let dx = ((px - cx) / rf).abs().powf(n);
+            let dy = ((py - cy) / rf).abs().powf(n);
+            dx + dy <= 1.0
         };
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
@@ -124,11 +127,27 @@ mod tests {
     fn rounded_rect_leaves_corners_transparent() {
         let mut buf = canvas(8, 8);
         let mut c = Canvas::new(&mut buf, 8, 8);
-        c.fill_rounded_rect(Rect::new(0, 0, 8, 8), 3, Color::rgba(255, 255, 255, 255));
+        c.fill_rounded_rect(Rect::new(0, 0, 8, 8), 4, Color::rgba(255, 255, 255, 255));
         assert_eq!(px(&buf, 8, 0, 0), [0, 0, 0, 0], "the top-left corner should be empty");
         assert_eq!(px(&buf, 8, 7, 7), [0, 0, 0, 0], "the bottom-right corner should be empty");
         assert_eq!(px(&buf, 8, 4, 4), [255, 255, 255, 255], "the centre should be solid");
         assert_eq!(px(&buf, 8, 0, 4), [255, 255, 255, 255], "the left edge midpoint should be solid");
+    }
+
+    /// The corner is a continuous (superellipse) curve, not a circular arc: it bulges past where a circle of the
+    /// same radius would sit, which is the difference between "one soft object" and "a square with cut corners".
+    #[test]
+    fn corners_are_continuous_not_circular() {
+        let mut buf = canvas(8, 8);
+        {
+            let mut c = Canvas::new(&mut buf, 8, 8);
+            c.fill_rounded_rect(Rect::new(0, 0, 8, 8), 4, Color::rgba(255, 255, 255, 255));
+        }
+        // Circle: dx = 2.5, dy = 3.5 from the corner centre (4, 4) → 6.25 + 12.25 = 18.5 > 16, outside.
+        // Superellipse with n = 4: 2.5⁴ + 3.5⁴ = 39 + 150 = 189 ≤ 256, inside.
+        assert_eq!(px(&buf, 8, 1, 0), [255, 255, 255, 255], "the shoulder must follow the superellipse, not the arc");
+        assert_eq!(px(&buf, 8, 0, 0), [0, 0, 0, 0], "the corner tip stays empty");
+        assert_eq!(px(&buf, 8, 4, 0), [255, 255, 255, 255], "the edge keeps its full extent");
     }
 
     #[test]

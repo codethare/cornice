@@ -68,6 +68,9 @@ modules = [
 [notification]
 # Behaviour of the built-in notification daemon (the cards notify-send pops up). The cards are drawn at the
 # place where a `notification` module sits (see [bar.right] above); without that module nothing is drawn.
+# The card's size is derived from the bar height, not configurable: width = 10 × height and corner radius =
+# 1.2 × height (Apple's expanded Live Activity: 371 pt wide and a 44 pt radius on a 36.67 pt island), so every
+# card in the stack is the same size and the bar reserves one width while anything is showing.
 # How many cards are drawn at once; the rest stay queued undrawn. Default 4. Minimum 1.
 max_visible = 4
 # Stretch duration of the column below the bar, in milliseconds, default 220.

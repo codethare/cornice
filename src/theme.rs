@@ -3,12 +3,30 @@
 use crate::geom::Color;
 use crate::text::TextStyle;
 
+/// Card width bounds; the derived width is a multiple of the bar height in between.
+pub const MIN_CARD_W: i32 = 80;
+pub const MAX_CARD_W: i32 = 420;
+/// Card width as a multiple of the bar height: Apple's expanded Live Activity is 371 pt wide on a 36.67 pt island,
+/// i.e. ~10× the compact height, and it is a *fixed* size rather than a shrink-wrap of its content, so every card
+/// in a stack is the same width and the bar reserves one width (HIG Live Activities, iOS dimensions).
+const CARD_W_PER_HEIGHT: i32 = 10;
+/// Card corner radius as a multiple of the bar height: the Dynamic Island uses a 44 pt radius on that same
+/// 36.67 pt island — 1.2× its height. That is far more than half the expanded height would allow as a capsule, so
+/// the expanded shape reads as one soft block (HIG Live Activities: "the Dynamic Island uses a corner radius of
+/// 44 points").
+const CARD_RADIUS_PER_HEIGHT: f32 = 1.2;
+
 #[derive(Clone)]
 pub struct Theme {
     pub background: Color,
     pub foreground: Color,
     pub accent: Color,
     pub font: TextStyle,
+    /// Supporting text: `foreground` at 72% alpha. Apple's hierarchy puts the notification's title in the primary
+    /// label and its body in the secondary one; a semibold face was not usable here — the requested weight resolved
+    /// outside the configured family (measured: "Card 6" went from 33.4 px to 53.6 px in `monospace`), which breaks
+    /// the monospace grid instead of emphasising the title.
+    pub secondary: Color,
     pub height: i32,
     pub radius: i32,
     pub padding: i32,
@@ -17,13 +35,18 @@ pub struct Theme {
     pub card_gap: i32,
     /// Notification card padding, default height/2
     pub card_padding: i32,
+    /// Notification card width and corner radius (see the constants above).
+    pub card_w: i32,
+    pub card_radius: i32,
 }
 
 impl Theme {
     pub fn defaults(height: i32) -> Self {
+        let foreground = Color::rgba(0xdc, 0xdc, 0xdc, 0xff);
         Self {
             background: Color::rgba(0x1a, 0x1a, 0x1a, 0xee),
-            foreground: Color::rgba(0xdc, 0xdc, 0xdc, 0xff),
+            foreground,
+            secondary: Color::rgba(foreground.r, foreground.g, foreground.b, (foreground.a as f32 * 0.72) as u8),
             accent: Color::rgba(0x88, 0xc0, 0xd0, 0xff),
             font: TextStyle::new(11.0, "monospace"),
             height,
@@ -32,6 +55,8 @@ impl Theme {
             spacing: 6,
             card_gap: (height / 5).max(2),
             card_padding: (height / 2).max(4),
+            card_w: (CARD_W_PER_HEIGHT * height).clamp(MIN_CARD_W, MAX_CARD_W),
+            card_radius: (height as f32 * CARD_RADIUS_PER_HEIGHT).round() as i32,
         }
     }
 }
@@ -68,5 +93,12 @@ mod tests {
         assert_eq!(t.radius, 15);
         assert_eq!(t.card_gap, 6);
         assert_eq!(t.card_padding, 15);
+        // Apple's ratios: the expanded Live Activity is 10× the island height wide and 1.2× it round.
+        assert_eq!(t.card_w, 300);
+        assert_eq!(t.card_radius, 36);
+        assert!(t.secondary.a < t.foreground.a, "the body is the secondary label, not the primary one");
+        // The derived values stay inside their bounds on a tall bar, and stay usable on a short one.
+        assert_eq!(Theme::defaults(120).card_w, MAX_CARD_W);
+        assert_eq!(Theme::defaults(4).card_w, MIN_CARD_W);
     }
 }

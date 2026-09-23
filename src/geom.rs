@@ -20,6 +20,19 @@ impl Rect {
     }
 }
 
+/// Continuous ("squircle") corner exponent: Apple's default corner curve is the superellipse
+/// `|x|ⁿ + |y|ⁿ = rⁿ` with n > 2 (`UICornerCurve.continuous`), whose curvature reaches zero where it meets the
+/// straight edge. A circular arc meets it at a tangent point instead, which is why a normal rounded rectangle
+/// reads as "a square with the corners cut off" rather than as one object. n = 4 is Figma's "corner smoothing
+/// 0.6 ≈ the iOS shape"; the value belongs to the shape language, so it is a constant and not a knob.
+pub const CORNER_EXPONENT: f32 = 4.0;
+
+/// Where a continuous corner crosses its 45° keyline, measured in from the bounding box: `r - r / 2^(1/n)`.
+/// A circular arc would give `r - r/√2`; the flatter superellipse pulls content closer to the short side.
+pub fn corner_inset(radius: i32) -> i32 {
+    (radius.max(0) as f32 * (1.0 - 2f32.powf(-1.0 / CORNER_EXPONENT))).round() as i32
+}
+
 /// Straight (non-premultiplied) alpha RGBA.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color { pub r: u8, pub g: u8, pub b: u8, pub a: u8 }
@@ -94,6 +107,15 @@ mod tests {
         // premultiplied byte order is B,G,R,A; premultiplication rounds (+127/255)
         assert_eq!(Color::rgba(0x11, 0x22, 0x33, 0xff).to_shm_bytes(), [0x33, 0x22, 0x11, 0xff]);
         assert_eq!(Color::rgba(0x40, 0x40, 0x40, 0x80).to_shm_bytes(), [0x20, 0x20, 0x20, 0x80]);
+    }
+
+    #[test]
+    fn corner_inset_shrinks_as_the_corner_softens() {
+        // n = 4: 1/2^(1/4) = 0.841, so the keyline sits ~0.16 r in — against 0.29 r for a circular arc.
+        assert_eq!(corner_inset(15), 2);
+        assert_eq!(corner_inset(0), 0);
+        assert!(corner_inset(15) < (15.0 * (1.0 - std::f32::consts::FRAC_1_SQRT_2)).round() as i32);
+        assert!(corner_inset(100) <= 17, "a bigger radius insets proportionally, not more than the corner");
     }
 
     #[test]

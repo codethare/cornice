@@ -72,9 +72,10 @@ pub struct NotifSurface {
 /// The geometric endpoints of the notification animation. Only one animation at a time (see `redraw_notifications`).
 #[derive(Clone)]
 enum AnimKind {
-    /// A new card stretches the column down; `id` is the notification entering (it must still be at the head).
-    Enter(u32),
-    /// A closed/expired card retracts the column back into the bar, and the rows shift up with it.
+    /// A new card stretches the stack down; `id` is the notification entering (it must still be at the head).
+    /// `fade` is false when the stack was already open, so only a fresh opening fades its text in.
+    Enter { id: u32, fade: bool },
+    /// A closed/expired card retracts the stack back into the bar, and the rows shift up with it.
     Exit,
 }
 
@@ -326,11 +327,11 @@ impl State {
         h.max(1) as u32
     }
 
-    /// The stretched column for the current queue: the notification module's slot is where it hangs off the bar.
+    /// The stack of visible notifications: the notification module's slot is where it hangs off the bar.
     /// `None` when the module is not configured, which is what turns the notification cards off entirely.
-    fn notif_column(&mut self, output_w: i32) -> Option<crate::notify::view::Column> {
+    fn notif_stack(&mut self, output_w: i32) -> Option<crate::notify::view::Stack> {
         let at = self.sections.notif_at()?;
-        let w = crate::notify::view::slot_width(self.queue.visible(), &mut self.text, &self.theme);
+        let w = crate::notify::view::slot_width(self.queue.visible(), &self.theme);
         if w != self.sections.notif_width() {
             // The card's width is reserved in the bar, so the bar re-lays out with it.
             self.sections.set_notif_width(w);
@@ -339,7 +340,7 @@ impl State {
         let widths = self.sections.widths(&mut self.text, &self.theme);
         let bar = crate::bar::layout(&widths, output_w, &self.theme);
         let slot = bar.slot(at)?;
-        Some(crate::notify::view::column(self.queue.visible(), slot.x, slot.w, output_w, &self.theme, &mut self.text))
+        Some(crate::notify::view::stack(self.queue.visible(), slot.x, output_w, &self.theme, &mut self.text))
     }
 
     /// Make sure the notification surface exists while the queue is non-empty or a leave animation is running.
@@ -371,14 +372,20 @@ impl State {
     /// Start the enter animation (the id must be the one just inserted at the head).
     fn start_enter(&mut self, id: u32, now: Instant) {
         let Some(output_w) = self.notif_output_width() else { return };
-        let Some(column) = self.notif_column(output_w) else { return };
-        // t=0 is the bar's own row: nothing has been stretched below it yet.
-        let start = Rect::new(column.rect.x, 0, column.rect.w, self.theme.height);
+        let Some(stack) = self.notif_stack(output_w) else { return };
+        // Apple's island opens onto the bar and stays open: a notification arriving while it is open *extends* it
+        // (`Update a Live Activity only when new content is available`), so the tween starts from the shape that is
+        // on screen instead of replaying the opening from the bar's row. Only a fresh opening fades its text in.
+        let open = self.anim.as_ref().filter(|a| matches!(a.kind, AnimKind::Enter { .. })).map(|a| (a.start, a.end, a.tween, now));
+        let (start, fade) = match open {
+            Some((s, e, tw, at)) => (crate::notify::view::stretch(s, e, Easing::Spring, &tw, at), false),
+            None => (Rect::new(stack.rect.x, 0, stack.rect.w, self.theme.height), true),
+        };
         self.set_anim(Some(Anim {
-            kind: AnimKind::Enter(id),
+            kind: AnimKind::Enter { id, fade },
             tween: Tween::new(now, self.cfg.notification.enter_ms),
             start,
-            end: column.rect,
+            end: stack.rect,
         }));
     }
 
@@ -400,17 +407,17 @@ impl State {
         if !self.queue.visible().iter().any(|n| n.id == id) {
             return self.drop_silently(id, reason);
         }
-        let Some(column) = self.notif_column(output_w) else { return self.drop_silently(id, reason) };
-        let start = column.rect;
+        let Some(stack) = self.notif_stack(output_w) else { return self.drop_silently(id, reason) };
+        let start = stack.rect;
         // The card leaves the queue right away: the remaining rows shift up and the shape retracts over them.
         if self.queue.remove(id).is_none() {
             return;
         }
-        // An empty queue has no column left to aim at, so the shape keeps its width and only drops its tail.
+        // An empty queue has no stack left to aim at, so the shape keeps its width and only drops its tail.
         let end = self
-            .notif_column(output_w)
+            .notif_stack(output_w)
             .filter(|_| !self.queue.is_empty())
-            .map_or(Rect::new(start.x, 0, start.w, self.theme.height), |c| c.rect);
+            .map_or(Rect::new(start.x, 0, start.w, self.theme.height), |s| s.rect);
         self.set_anim(Some(Anim {
             kind: AnimKind::Exit,
             tween: Tween::new(now, self.cfg.notification.exit_ms),
@@ -429,7 +436,7 @@ impl State {
         if let Some(anim) = &self.anim {
             if anim.tween.is_done(now) {
                 drop_anim = true;
-            } else if let AnimKind::Enter(id) = anim.kind {
+            } else if let AnimKind::Enter { id, .. } = anim.kind {
                 if !self.queue.visible().first().is_some_and(|n| n.id == id) {
                     drop_anim = true;
                 }
@@ -468,25 +475,24 @@ impl State {
         let Some(output_w) = self.notif_output_width() else { return };
 
         // 5. Geometry (independent of whether the surface is configured; uses the bar width).
-        let Some(column) = self.notif_column(output_w) else { return };
-        // The enter's endpoint follows the latest layout: a module that grows beside the card widens the slot.
+        let Some(stack) = self.notif_stack(output_w) else { return };
+        // The enter's endpoint follows the latest layout: another notification extends the stack while it is open.
         if let Some(anim) = self.anim.as_mut() {
-            if matches!(&anim.kind, AnimKind::Enter(_)) {
-                anim.start = Rect::new(column.rect.x, 0, column.rect.w, self.theme.height);
-                anim.end = column.rect;
+            if matches!(&anim.kind, AnimKind::Enter { .. }) {
+                anim.end = stack.rect;
             }
         }
-        // The shape this frame: the tween's interpolation, or the laid-out column when nothing is animating.
+        // The shape this frame: the tween's interpolation, or the laid-out stack when nothing is animating.
         let shape = match &self.anim {
             Some(a) => match a.kind {
-                AnimKind::Enter(_) => crate::notify::view::stretch(a.start, a.end, Easing::OutCubic, &a.tween, now),
-                AnimKind::Exit => crate::notify::view::stretch(a.start, a.end, Easing::InOutCubic, &a.tween, now),
+                AnimKind::Enter { .. } => crate::notify::view::stretch(a.start, a.end, Easing::Spring, &a.tween, now),
+                AnimKind::Exit => crate::notify::view::stretch(a.start, a.end, Easing::Smooth, &a.tween, now),
             },
-            None => column.rect,
+            None => stack.rect,
         };
-        // The text fades in only on the enter; a retracting column keeps its rows readable while it shrinks.
-        let alpha = match &self.anim {
-            Some(a) if matches!(a.kind, AnimKind::Enter(_)) => {
+        // Only a fresh opening fades its text in: an extended stack keeps the rows that were already visible.
+        let head_alpha = match &self.anim {
+            Some(a) if matches!(a.kind, AnimKind::Enter { fade: true, .. }) => {
                 let t = a.tween.progress(now);
                 ((t - 0.35) / 0.65).clamp(0.0, 1.0)
             }
@@ -504,19 +510,21 @@ impl State {
         let mut c = crate::canvas::Canvas::new(canvas, w, h);
         c.clear();
         let shape = shape.intersect(Rect::new(0, 0, w, h));
-        crate::notify::view::render_column(&mut c, shape, self.theme.height, shape, &self.theme);
+        for (i, card) in stack.cards.iter().enumerate() {
+            crate::notify::view::render_card_background(&mut c, card, i == 0, self.theme.height, shape, &self.theme);
+        }
         c.set_clip(Some(shape));
 
         let mut hits: Vec<(Rect, Action)> = Vec::new();
         for (i, n) in self.queue.visible().iter().enumerate() {
-            let Some(card) = column.cards.get(i) else { break };
-            let band = card.band.intersect(shape);
-            if band.is_empty() {
+            let Some(card) = stack.cards.get(i) else { break };
+            let area = card.rect.intersect(shape);
+            if area.is_empty() {
                 continue;
             }
-            let mut card_hits = crate::notify::view::render(&mut c, card, alpha, n, &self.theme, &mut self.text);
+            let mut card_hits = crate::notify::view::render(&mut c, card, if i == 0 { head_alpha } else { 1.0 }, n, &self.theme, &mut self.text);
             hits.append(&mut card_hits); // buttons first
-            hits.push((band, Action::NotificationClose(n.id))); // card body after
+            hits.push((area, Action::NotificationClose(n.id))); // card body after
         }
         c.set_clip(None);
 
@@ -539,7 +547,7 @@ impl State {
     fn redraw(&mut self, output: &wl_output::WlOutput) {
         let qh = self.qh.clone();
         // The bar reserves the current card width for the notification module before it is laid out.
-        let card_w = crate::notify::view::slot_width(self.queue.visible(), &mut self.text, &self.theme);
+        let card_w = crate::notify::view::slot_width(self.queue.visible(), &self.theme);
         self.sections.set_notif_width(card_w);
         let theme = &self.theme;
         let text = &mut self.text;

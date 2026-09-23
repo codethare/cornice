@@ -263,13 +263,21 @@ ge $((BAR_H + 20)) "$long_y1" "…down to the last body row ($long_y1)"
 eq $((OUT_W - 16)) "$long_x1" "the stretch stops where the pill's bottom edge starts to curve (${long_x0}..${long_x1})"
 eq 1 "$(px bands "$W/long.ppm" $((long_x1 - 20)) 0 $((long_y1 + 1)))" "the bar and the stretched card are one unbroken piece"
 
-# "A second notification keeps stretching downwards": both cards share one background.
+# "A second notification keeps stretching downwards": macOS-style, it is its own card below the head one.
 n3=$(notify cornice-test 0 "" "Second" "also here" "[]" "{}" 0)
 sleep 1.8
 shot two
 read -r _ _ _ two_y1 _ < <(card_region "$W/two.ppm")
 ge $((long_y1 + 20)) "$two_y1" "a second card keeps stretching downwards ($long_y1 -> $two_y1)"
-eq 1 "$(px bands "$W/two.ppm" $((long_x1 - 20)) 0 $((two_y1 + 1)))" "the two cards keep one unbroken background"
+# Mid-card: the head card's bottom corners are round (radius 1.2 × bar height), so a column near the edge would
+# leave the shape early. Only the junction is scanned, so the check does not depend on how tall the new card is.
+mid=$(( (long_x0 + long_x1) / 2 ))
+eq 1 "$(px bands "$W/two.ppm" $mid 0 $((BAR_H + 6)))" "the new head card is one unbroken piece with the bar"
+eq 2 "$(px bands "$W/two.ppm" $mid 0 $((two_y1 + 1)))" "the second card is its own card, one gap below (macOS stacking)"
+read -r hx0 _ hx1 _ _ < <(region "$W/two.ppm" 900 $BAR_H 1280 $((long_y1 + 1)))
+read -r sx0 _ sx1 _ _ < <(region "$W/two.ppm" 900 $((long_y1 + 1)) 1280 $((two_y1 + 1)))
+eq "$hx0" "$sx0" "both cards have the same width (left edge $hx0)"
+eq "$hx1" "$sx1" "both cards have the same width (right edge $hx1)"
 close_all
 shot nt0
 eq 0 "$(bands nt0)" "CloseNotification removes the card"

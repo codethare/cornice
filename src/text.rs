@@ -232,4 +232,6 @@ mod tests {
         let ink = e.cap_top(&style, 100, 15) as f32 + m.top;
         assert_eq!(ink, 115.0, "the ink top must land on the padding edge");
     }
+
 }
+

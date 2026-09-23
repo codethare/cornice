@@ -74,12 +74,12 @@ logs, screenshots and the test config stay under `W`. Needs `grim`, `gcc`, `wayl
 
 Checks: bar band and height, left/center/right placement and the optical inset at the bar's rounded ends,
 a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), that a short card is drawn
-*inside* the bar while a long body stretches the same background below it (one unbroken column from the bar's row
-down, attaching where the pill's bottom edge is straight), that a second card keeps stretching the same shape,
-`expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed` reason 1, a replace stays put
-while a new id is still stretching (measured), `max_visible` stacking, card click → reason 2, action button →
-`ActionInvoked`, click-through on a transparent region, idle CPU, config errors with line numbers, and the
-two-output behaviour.
+*inside* the bar while a long body stretches below it (one unbroken piece from the bar's row down, attaching where
+the pill's bottom edge is straight), that a second notification is its own card one `card_gap` below at the same
+width (macOS stacking), `expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed`
+reason 1, a replace stays put while a new id is still stretching (the spring is measured), `max_visible` stacking,
+card click → reason 2, action button → `ActionInvoked`, click-through on a transparent region, idle CPU, config
+errors with line numbers, and the two-output behaviour.
 
 - **Proves**: the whole checklist below except the two items marked *(human)* — on river + tailrace, with pixels and pointer input.
 - **Does not prove**: that the animation *feels* right (the harness measures rects, it cannot judge easing), anything
@@ -89,8 +89,11 @@ two-output behaviour.
 ### Manual pass on the real machine
 
 - [ ] *(human)* The stretch reads as the bar's own material pulling downwards — to watch it slowly, set
-      `[notification] enter_ms = 60000` and take a screenshot every second: the column's top edge stays at the bar's
+      `[notification] enter_ms = 60000` and take a screenshot every second: the shape's top edge stays at the bar's
       top while its bottom edge walks down, and at no frame is there a lighter or darker band where the two meet
+- [ ] *(human)* The corners read as Apple's continuous (squircle) curve rather than a cut-off square, and the stack
+      reads as macOS: the head card attached to the bar, each later notification its own equally wide, equally round
+      card below it, with a visible gap between the cards
 - [ ] *(human)* `notify-send -r <id>` on a visible card updates it in place, without replaying the stretch
 - [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
       the left and right gaps should read the same (`docs/smoke.md`)

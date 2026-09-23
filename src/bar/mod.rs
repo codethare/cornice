@@ -127,14 +127,14 @@ impl BarLayout {
 
 /// Optical inset for the bar's rounded ends.
 ///
-/// A pill's end is not a straight edge: the boundary curves away from the text, so a gap measured from
-/// the bounding box reads smaller than the measured one, and the eye hangs the text in the corner.
-/// Content is pushed in to the corner's 45° keyline, `r - r/√2` ≈ 0.29 r — the same rule keyline grids
-/// use when a circle has to read the same size as a square next to it:
-/// https://adamarant.com/en/blog/optical-alignment-in-ui-7-spacing-fixes-math-gets-wrong (with the
-/// landing rule: the correction belongs to the component, so it is derived from `radius`, not a knob).
+/// A pill's end is not a straight edge: the boundary curves away from the text, so a gap measured from the
+/// bounding box reads smaller than the measured one and the eye hangs the text in the corner. Content is pushed
+/// in to the corner's 45° keyline — the same rule keyline grids use when a circle has to read the same size as a
+/// square next to it. The corners are continuous (superellipse, see `geom::CORNER_EXPONENT`), so this is
+/// `geom::corner_inset`, not `r(1-1/√2)`: a softer corner leaves less to correct. The correction belongs to the
+/// component, so it is derived from `radius` and is not a knob.
 pub fn end_inset(radius: i32) -> i32 {
-    (radius.max(0) as f32 * (1.0 - std::f32::consts::FRAC_1_SQRT_2)).round() as i32
+    crate::geom::corner_inset(radius)
 }
 
 /// Each section lays its items out by `spacing`; center is allocated first among the three.
@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn three_sections_are_placed_as_specified() {
         let t = Theme::defaults(30); // padding 8, spacing 6, radius 15
-        let i = end_inset(t.radius); // 4
-        assert_eq!(i, 4);
+        let i = end_inset(t.radius); // 2: the continuous corner is fuller than a circular one
+        assert_eq!(i, 2);
         let out = layout(&widths(&[20, 20], &[50], &[30, 30]), 1000, &t);
         assert_eq!(out.left[0], Rect::new(8 + i, 0, 20, 30));
         assert_eq!(out.left[1], Rect::new(8 + i + 20 + 6, 0, 20, 30));
