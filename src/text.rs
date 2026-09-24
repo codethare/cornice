@@ -94,13 +94,6 @@ impl TextEngine {
         (centre - m.cap / 2.0 - m.top).round() as i32
     }
 
-    /// The `top` to pass to `draw` so the cap's top edge sits `pad` below `box_y` — the text-block
-    /// equivalent of `optical_top`, used where the block is top-aligned (a notification card).
-    pub fn cap_top(&mut self, style: &TextStyle, box_y: i32, pad: i32) -> i32 {
-        let m = self.cap_metrics(style);
-        box_y + pad - m.top.round() as i32
-    }
-
     /// The returned `Attrs` borrows `style` rather than self — otherwise it would hold an immutable borrow of self until
     /// would conflict with `buffer.borrow_with(&mut self.font_system)` once the immutable borrow of `font_system` ends.
     fn attrs(style: &TextStyle) -> Attrs<'_> {
@@ -222,15 +215,6 @@ mod tests {
                 box_h as f32 / 2.0
             );
         }
-    }
-
-    #[test]
-    fn cap_top_puts_the_cap_exactly_pad_below_the_edge() {
-        let mut e = TextEngine::new();
-        let style = TextStyle::new(11.0, "monospace");
-        let m = e.cap_metrics(&style);
-        let ink = e.cap_top(&style, 100, 15) as f32 + m.top;
-        assert_eq!(ink, 115.0, "the ink top must land on the padding edge");
     }
 
 }

@@ -263,21 +263,35 @@ ge $((BAR_H + 20)) "$long_y1" "…down to the last body row ($long_y1)"
 eq $((OUT_W - 16)) "$long_x1" "the stretch stops where the pill's bottom edge starts to curve (${long_x0}..${long_x1})"
 eq 1 "$(px bands "$W/long.ppm" $((long_x1 - 20)) 0 $((long_y1 + 1)))" "the bar and the stretched card are one unbroken piece"
 
-# "A second notification keeps stretching downwards": macOS-style, it is its own card below the head one.
+# "Everything behind the first collapses into one peek pill": the remainder is not a second full card. A column
+# of full cards grows along the screen's scarce axis, and on a 16:9 output the last of four lands on the vertical
+# midline, inside the user's focus. The pill is the bar's own compact shape: one bar tall, `theme.radius` corners.
 n3=$(notify cornice-test 0 "" "Second" "also here" "[]" "{}" 0)
 sleep 1.8
 shot two
 read -r _ _ _ two_y1 _ < <(card_region "$W/two.ppm")
-ge $((long_y1 + 20)) "$two_y1" "a second card keeps stretching downwards ($long_y1 -> $two_y1)"
+# The pill's top edge is one bar above the stack's bottom, so `card_gap` (height/5 = 6) above it is the gap and
+# must be background. Were the pill any taller, this window would land inside it and find pixels.
+pill_top=$(( two_y1 - BAR_H + 1 ))
+read -r _ _ _ _ gapn < <(region "$W/two.ppm" 900 $((pill_top - 6)) 1280 "$pill_top")
+eq 0 "$gapn" "the peek pill is exactly one bar tall (the card_gap above it is background)"
 # Mid-card: the head card's bottom corners are round (radius 1.2 × bar height), so a column near the edge would
-# leave the shape early. Only the junction is scanned, so the check does not depend on how tall the new card is.
+# leave the shape early. Only the junction is scanned, so the check does not depend on how tall the head card is.
 mid=$(( (long_x0 + long_x1) / 2 ))
-eq 1 "$(px bands "$W/two.ppm" $mid 0 $((BAR_H + 6)))" "the new head card is one unbroken piece with the bar"
-eq 2 "$(px bands "$W/two.ppm" $mid 0 $((two_y1 + 1)))" "the second card is its own card, one gap below (macOS stacking)"
-read -r hx0 _ hx1 _ _ < <(region "$W/two.ppm" 900 $BAR_H 1280 $((long_y1 + 1)))
-read -r sx0 _ sx1 _ _ < <(region "$W/two.ppm" 900 $((long_y1 + 1)) 1280 $((two_y1 + 1)))
-eq "$hx0" "$sx0" "both cards have the same width (left edge $hx0)"
-eq "$hx1" "$sx1" "both cards have the same width (right edge $hx1)"
+eq 1 "$(px bands "$W/two.ppm" $mid 0 $((BAR_H + 6)))" "the head card is one unbroken piece with the bar"
+eq 2 "$(px bands "$W/two.ppm" $mid 0 $((two_y1 + 1)))" "the pill is its own shape one gap below the head card (macOS collapsing stack)"
+# The pill is the same width as a card. Measured against the long card's row 30 rather than the head card here:
+# a 49 px head card is already inside its own 36 px corner curve at row 30, so its bbox is a pixel narrower on
+# each side than the rect it shares with the pill.
+read -r px0 _ px1 _ _ < <(region "$W/two.ppm" 900 "$pill_top" 1280 $((two_y1 + 1)))
+eq "$long_x0" "$px0" "the pill is as wide as the head card (left edge $px0)"
+eq "$long_x1" "$px1" "the pill is as wide as the head card (right edge $px1)"
+n4=$(notify cornice-test 0 "" "Third" "also here" "[]" "{}" 0)
+sleep 1.8
+shot three
+read -r _ _ _ three_y1 _ < <(card_region "$W/three.ppm")
+eq "$two_y1" "$three_y1" "a third notification does not lengthen the stack: the remainder is collapsed, not stacked"
+eq 2 "$(px bands "$W/three.ppm" $mid 0 $((three_y1 + 1)))" "…still exactly two shapes"
 close_all
 shot nt0
 eq 0 "$(bands nt0)" "CloseNotification removes the card"
@@ -339,10 +353,10 @@ fi
 eq 0 "$(closed_pairs | grep -c "^$n7 ")" "a new id emits no NotificationClosed"
 close_all
 
-sec "queue: max_visible caps the stack"
+sec "queue: depth does not lengthen the stack"
 close_all
-# One card, then two: the per-card step is measured rather than assumed, because a card's height comes from the
-# font metrics (cap height, line advance) and not from a constant in this script.
+# One card, then two: the second notification hangs the pill below the head card. Six leave the same two shapes,
+# so a deep queue no longer walks the stack down the screen.
 notify cornice-test 0 "" "Card 1" "body 1" "[]" "{}" 0 >/dev/null
 sleep 1.8
 shot q1
@@ -351,25 +365,33 @@ notify cornice-test 0 "" "Card 2" "body 2" "[]" "{}" 0 >/dev/null
 sleep 1.8
 shot q2
 read -r _ _ _ q2y _ < <(card_region "$W/q2.ppm")
-step=$(( q2y - q1y ))
-close_all
+ge $((q1y + 20)) "$q2y" "a second notification hangs the pill below the head card ($q1y -> $q2y)"
 ids=""
-for i in 1 2 3 4 5 6; do
+for i in 3 4 5 6; do
     ids="$ids $(notify cornice-test 0 "" "Card $i" "body $i" "[]" "{}" 0)"
     sleep 0.15
 done
 sleep 1.8
 shot stack
 read -r _ _ _ stack_y1 _ < <(card_region "$W/stack.ppm")
-eq $(( q1y + 3 * step )) "$stack_y1" "6 notifications leave exactly max_visible=4 cards stacked (${step}px per card)"
-first=$(echo $ids | awk '{print $1}')
-close_id "$first"
+eq "$q2y" "$stack_y1" "6 notifications leave the same two shapes as 2 (the tail is collapsed)"
+head_id=$(echo $ids | awk '{print $NF}')   # ids run oldest → newest, so the last one is the head card
+close_id "$head_id"
 sleep 0.8
 shot stack2
 read -r _ _ _ stack2_y1 _ < <(card_region "$W/stack2.ppm")
-eq "$stack_y1" "$stack2_y1" "a hidden card slides in when a visible one closes"
-last=$(echo $ids | awk '{print $NF}')
-if closed_pairs | grep -q "^$last "; then bad "an overflowed (never visible) card emitted NotificationClosed"; else ok "an overflowed card emits nothing"; fi
+eq "$stack_y1" "$stack2_y1" "closing the head card slides the pill up into its place"
+eq 2 "$(bands stack2)" "…and the stack is still two shapes"
+if closed_pairs | grep -q "^$head_id 3$"; then ok "CloseNotification on the head emits NotificationClosed(id=$head_id, reason=3)"; else bad "CloseNotification emitted nothing for $head_id: $(closed_pairs | tail -3 | tr '\n' ' ')"; fi
+# A card inside the visible window but past the drawn pair: closing it changes nothing on screen, so it must not
+# start an animation — the shape stays where it is and only the queue advances.
+last=$(echo $ids | awk '{print $1}')
+close_id "$last"
+sleep 0.8
+shot stack3
+read -r _ _ _ stack3_y1 _ < <(card_region "$W/stack3.ppm")
+eq "$stack2_y1" "$stack3_y1" "closing a card past the drawn pair leaves the shape where it is"
+if closed_pairs | grep -q "^$last 3$"; then ok "…and it still emits NotificationClosed(id=$last, reason=3)"; else bad "no NotificationClosed(3) for a never-drawn card: $(closed_pairs | tail -3 | tr '\n' ' ')"; fi
 close_all
 
 sec "pointer: card click, action button, click-through"

@@ -10,6 +10,11 @@ use crate::text::TextEngine;
 use crate::theme::Theme;
 use crate::widget::Action;
 
+/// The stack is a screen-space budget, not a proportion of the bar. A 24" 1920×1080 at 60 cm viewing distance
+/// spans 47.7° horizontally but only 28.0° vertically, so on a 16:9 output the vertical axis is the scarce one
+/// and the notification stack may borrow at most this share of it (see `max_tail`).
+const MAX_TAIL_PERCENT: i32 = 25;
+
 pub fn urgency_color(u: Urgency, theme: &Theme) -> Color {
     match u {
         Urgency::Low | Urgency::Normal => theme.foreground,
@@ -41,7 +46,7 @@ fn straight_band(x: i32, w: i32, output_w: i32, theme: &Theme) -> (i32, i32) {
     (x, w.min(output_w - r - x).max(0))
 }
 
-/// One visible notification: its own card, newest at the top.
+/// One drawn notification: the head card, or the peek pill of the collapsed remainder. Newest at the top.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Card {
     /// The card's rect: background, hit rect. The head card's top edge is the bar's top.
@@ -52,9 +57,11 @@ pub struct Card {
     pub body: i32,
     /// The action row's pill top; the pill is one line tall.
     pub actions: Option<i32>,
+    /// The collapsed peek pill: one bar tall, summary only, `theme.radius` corners. Only the first card is not one.
+    pub peek: bool,
 }
 
-/// The stack: the head card hanging off the bar, every later notification its own card below it.
+/// The stack: the head card hanging off the bar, and behind it the collapsed peek pill.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stack {
     /// The stretched extent. Its top is the bar's top, so the overlap with the bar is invisible.
@@ -62,37 +69,43 @@ pub struct Stack {
     pub cards: Vec<Card>,
 }
 
-/// Lay the visible notifications out. The head card's summary shares the bar's text line and only the rows that do
-/// not fit in the bar stretch below it; macOS-style, each later notification is its own rounded card below that,
-/// newest first, with `card_gap` between the cards.
+/// Lay the visible notifications out: the head card, plus one collapsed peek pill for everything behind it.
+/// The head card's summary shares the bar's text line, so only the rows that do not fit in the bar stretch below
+/// it; a separate full card per notification would grow the stack along the screen's scarce axis (see
+/// `MAX_TAIL_PERCENT`), so everything past the first is one pill that says which notification is next.
 pub fn stack(visible: &[Notification], slot_x: i32, output_w: i32, theme: &Theme, text: &mut TextEngine) -> Stack {
     let (x, w) = straight_band(slot_x, theme.card_w, output_w, theme);
     let line = line_height(theme);
     let m = text.cap_metrics(&theme.font);
-    let mut cards: Vec<Card> = Vec::with_capacity(visible.len());
-    let mut top = 0;
-    for (i, n) in visible.iter().enumerate() {
-        let body = body_lines(n);
-        // The head card shares the bar's line; every later card pads its summary from its own top edge.
-        let summary = if i == 0 { text.optical_top(&theme.font, 0, theme.height) } else { text.cap_top(&theme.font, top, theme.card_padding) };
-        let mut next = summary; // box top of the row after the last one drawn
-        let mut last_ink = summary + m.top.round() as i32 + m.cap.ceil() as i32; // ink bottom of the last row drawn
-        for _ in 0..body {
-            next += line;
-            last_ink = next + m.top.round() as i32 + m.cap.ceil() as i32;
-        }
-        let actions = if n.actions.is_empty() {
-            None
-        } else {
-            next += theme.card_gap / 2;
-            last_ink = next + line;
-            Some(next)
-        };
-        // A head card whose rows fit in the bar owns just the bar's row and stretches nowhere. Once a row lands
-        // below the bar, the card keeps its bottom padding, so it ends `card_padding` below the last baseline.
-        let bottom = if i == 0 && last_ink <= theme.height { theme.height } else { last_ink + theme.card_padding };
-        cards.push(Card { rect: Rect::new(x, top, w, bottom - top), summary, body: summary + line, actions });
-        top = bottom + theme.card_gap;
+    let mut cards: Vec<Card> = Vec::with_capacity(2);
+    let Some(head) = visible.first() else {
+        return Stack { rect: Rect::new(x, 0, w, theme.height), cards };
+    };
+    // The head card shares the bar's own text line. A card whose rows fit in the bar owns just that row and
+    // stretches nowhere; once a row lands below the bar the card keeps its bottom padding, so it ends
+    // `card_padding` below the last baseline.
+    let summary = text.optical_top(&theme.font, 0, theme.height);
+    let mut next = summary; // box top of the row after the last one drawn
+    let mut last_ink = summary + m.top.round() as i32 + m.cap.ceil() as i32; // ink bottom of the last row drawn
+    for _ in 0..body_lines(head) {
+        next += line;
+        last_ink = next + m.top.round() as i32 + m.cap.ceil() as i32;
+    }
+    let actions = if head.actions.is_empty() {
+        None
+    } else {
+        next += theme.card_gap / 2;
+        last_ink = next + line;
+        Some(next)
+    };
+    let bottom = if last_ink <= theme.height { theme.height } else { last_ink + theme.card_padding };
+    cards.push(Card { rect: Rect::new(x, 0, w, bottom), summary, body: summary + line, actions, peek: false });
+    // The collapsed remainder: the bar's own compact shape — one bar tall, `radius` corners — carrying the next
+    // notification's summary. Entries past it stay in the queue and slide in as the ones ahead of them go.
+    if visible.len() > 1 {
+        let y = bottom + theme.card_gap;
+        let top = text.optical_top(&theme.font, y, theme.height);
+        cards.push(Card { rect: Rect::new(x, y, w, theme.height), summary: top, body: top, actions: None, peek: true });
     }
     let h = cards.last().map_or(theme.height, |c| c.rect.bottom());
     Stack { rect: Rect::new(x, 0, w, h), cards }
@@ -108,7 +121,8 @@ pub fn render_card_background(canvas: &mut Canvas, card: &Card, head: bool, bar_
     if area.is_empty() {
         return;
     }
-    let r = theme.card_radius;
+    // The peek pill is the bar's shape, not a card: one bar tall, so `theme.radius` — a capsule — closes it.
+    let r = if card.peek { theme.radius } else { theme.card_radius };
     // Shifting the shape up by `r` puts its top corners above the clip, so an attached card keeps straight sides
     // where it meets the bar while its bottom corners are as round as the shape language wants.
     let shape = if head { Rect::new(card.rect.x, card.rect.y - r, card.rect.w, card.rect.h + r) } else { card.rect };
@@ -129,6 +143,14 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, n: &Notification, th
     let x = card.rect.x + theme.card_padding;
     // Inner width: all text is truncated to the card; summary is untrusted D-Bus input and must be truncated.
     let inner_w = (card.rect.w - theme.card_padding * 2).max(0) as f32;
+
+    // The peek pill is not a card: no body and no buttons, the summary in the secondary colour, and it is a
+    // pointer at the next notification rather than the label the user is meant to read in place.
+    if card.peek {
+        let s = crate::text::truncate_to_width(&n.summary, inner_w, |t: &str| text.measure(t, &theme.font).0);
+        text.draw(canvas, &s, x, card.summary, &theme.font, fa(theme.secondary));
+        return Vec::new();
+    }
 
     // Apple's notification anatomy: the title in the primary label colour, the body in the secondary one.
     let summary = crate::text::truncate_to_width(&n.summary, inner_w, |t: &str| text.measure(t, &theme.font).0);
@@ -173,12 +195,20 @@ pub fn stretch(start: Rect, end: Rect, easing: Easing, tw: &Tween, now: Instant)
 }
 
 /// Upper bound of the stack's extent below the bar, used to size the notification surface once: a resize per
-/// animation frame would stutter, so the surface must already be tall enough for every frame.
-pub fn max_tail(max_visible: usize, theme: &Theme, text: &mut TextEngine) -> i32 {
+/// animation frame would stutter, so the surface must already be tall enough for every frame. It is capped at
+/// `MAX_TAIL_PERCENT` of the output's height: `bar.height` is a config knob (1..=256) and on a short screen the
+/// screen, not the bar, has to decide how much of it a notification may cover. Anything past the cap is clipped
+/// by the surface; there is no other way for it to fail. `output_h` is `None` when the compositor advertises
+/// neither a logical size nor a current mode, which leaves the derived bound uncapped.
+pub fn max_tail(theme: &Theme, text: &mut TextEngine, output_h: Option<i32>) -> i32 {
     let line = line_height(theme);
     let cap = text.cap_metrics(&theme.font).cap.ceil() as i32;
     let worst_card = theme.card_padding * 2 + cap + line * (crate::notify::queue::MAX_BODY_LINES as i32 + 1) + theme.card_gap / 2;
-    (worst_card + theme.card_gap) * (max_visible as i32 + 1)
+    let tail = worst_card + theme.card_gap + theme.height; // head card, gap, peek pill
+    match output_h {
+        Some(h) if h > 0 => tail.min(h * MAX_TAIL_PERCENT / 100),
+        _ => tail,
+    }
 }
 
 #[cfg(test)]
@@ -244,21 +274,76 @@ mod tests {
         assert_eq!(s.rect.bottom(), head.rect.bottom());
     }
 
-    /// "A second notification keeps stretching downwards": it is its own card, `card_gap` below the head one.
+    /// The head card's ink sits one card_padding above its bottom edge, so the text block does not read as
+    /// sitting high in its box; the top of the block is the bar's own line.
     #[test]
-    fn the_stack_grows_downwards_card_by_card() {
+    fn card_text_keeps_equal_optical_padding() {
         let t = Theme::defaults(30);
         let mut text = TextEngine::new();
-        let a = note(1, "First", "body");
-        let b = note(2, "Second", "");
-        let s = laid_out(&[a, b], 0, 1000, &t, &mut text);
-        assert_eq!(s.cards.len(), 2);
-        assert_eq!(s.cards[1].rect.y, s.cards[0].rect.bottom() + t.card_gap);
-        assert_eq!(s.rect.bottom(), s.cards[1].rect.bottom(), "the stretch covers every card");
+        // no descenders, so the ink bottom is the baseline: padding below the baseline is what gets measured
+        let n = note(1, "Hi", "no descenders");
+        let w = t.card_w;
+        let h = 140;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let s = laid_out(&[n.clone()], 0, w, &t, &mut text);
+        {
+            let mut c = Canvas::new(&mut buf, w, h);
+            c.set_clip(Some(s.rect));
+            render(&mut c, &s.cards[0], 1.0, &n, &t, &mut text);
+        }
+        let ink_rows: Vec<i32> = (0..h)
+            .filter(|y| (0..w).any(|x| buf[((y * w + x) * 4) as usize] > 60))
+            .collect();
+        let last = *ink_rows.last().unwrap();
+        assert_eq!(last, s.rect.bottom() - t.card_padding - 1, "ink bottom must sit card_padding above the card's bottom edge");
+        let first = *ink_rows.first().unwrap();
+        let m = text.cap_metrics(&t.font);
+        assert_eq!(first, s.cards[0].summary + m.top.round() as i32, "the head summary sits on the bar's text line");
+    }
+
+    /// "Everything behind the first is collapsed": six notifications draw the head card plus one peek pill.
+    /// A full card each would carry the stack down the screen's scarce axis (see `MAX_TAIL_PERCENT`).
+    #[test]
+    fn everything_past_the_head_is_one_peek_pill() {
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let notes: Vec<Notification> = (0..6).map(|i| note(i + 1, &format!("Card {i}"), "body")).collect();
+        let s = laid_out(&notes, 0, 1000, &t, &mut text);
+        assert_eq!(s.cards.len(), 2, "the head card and one pill, however long the queue");
+        let (head, peek) = (&s.cards[0], &s.cards[1]);
+        assert!(!head.peek && peek.peek);
+        assert_eq!(peek.rect.y, head.rect.bottom() + t.card_gap, "the pill hangs one card_gap below the head card");
+        assert_eq!(peek.rect.h, t.height, "the pill is the bar's own compact shape");
+        assert_eq!(peek.rect.w, head.rect.w, "the pill is as wide as the card it hangs under");
+        assert_eq!(s.rect.bottom(), peek.rect.bottom(), "the stretch covers the pill");
         assert_eq!(s.rect.y, 0, "the shape starts at the bar's top and its overlap with the bar is invisible");
         // Apple's expanded Live Activity is one fixed size, so a one-word card and a three-line card are equally
         // wide and the stack is a column.
         assert!(s.cards.iter().all(|c| c.rect.w == t.card_w && c.rect.x == s.rect.x));
+    }
+
+    /// The pill is its own shape: the gap between it and the head card is background, so the two do not merge.
+    #[test]
+    fn the_peek_pill_is_its_own_shape_with_a_gap() {
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let head = note(1, "Head", "one");
+        let second = note(2, "Second", "two");
+        let w = t.card_w;
+        let h = 200;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let s = laid_out(&[head, second], 0, w, &t, &mut text);
+        {
+            let mut c = Canvas::new(&mut buf, w, h);
+            render_card_background(&mut c, &s.cards[0], true, t.height, s.rect, &t);
+            render_card_background(&mut c, &s.cards[1], false, t.height, s.rect, &t);
+        }
+        let mid = s.rect.x + s.rect.w / 2;
+        let a = |y: i32| buf[((y * w + mid) * 4) as usize + 3];
+        let gap_y = s.cards[0].rect.bottom() + t.card_gap / 2;
+        assert_eq!(a(gap_y), 0, "the gap between head and pill must stay transparent, got {} at {gap_y}", a(gap_y));
+        assert_ne!(a(s.cards[1].rect.y + 2), 0, "the pill is painted");
+        assert_ne!(a(s.cards[0].rect.bottom() - 1), 0, "the head card is painted down to its own edge");
     }
 
     /// The stretch may only attach where the bar's bottom edge is straight, or its square top corners would
@@ -341,80 +426,28 @@ mod tests {
         }
     }
 
-    /// macOS stacks notifications as separate cards, so the gap between two of them is background — the cards do
-    /// not merge into one shape.
+    /// macOS collapses the stack behind the head card, so the gap between the two shapes is background.
     #[test]
-    fn cards_below_the_head_are_their_own_card() {
-        let t = Theme::defaults(30);
-        let mut text = TextEngine::new();
-        let head = note(1, "Head", "one");
-        let second = note(2, "Second", "two");
-        let w = t.card_w;
-        let h = 200;
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        let s = laid_out(&[head, second], 0, w, &t, &mut text);
-        {
-            let mut c = Canvas::new(&mut buf, w, h);
-            render_card_background(&mut c, &s.cards[0], true, t.height, s.rect, &t);
-            render_card_background(&mut c, &s.cards[1], false, t.height, s.rect, &t);
-        }
-        let mid = s.rect.x + s.rect.w / 2;
-        let gap_y = s.cards[0].rect.bottom() + t.card_gap / 2;
-        let a = |y: i32| buf[((y * w + mid) * 4) as usize + 3];
-        assert_eq!(a(gap_y), 0, "the gap between two cards must stay transparent, got {} at {gap_y}", a(gap_y));
-        assert_ne!(a(s.cards[1].rect.y + t.card_padding), 0, "the second card is painted");
-        assert_ne!(a(s.cards[0].rect.bottom() - 1), 0, "the head card is painted down to its own edge");
-    }
-
-    /// The head card's ink sits one card_padding above its bottom edge, so the text block does not read as
-    /// sitting high in its box; the top of the block is the bar's own line.
-    #[test]
-    fn card_text_keeps_equal_optical_padding() {
-        let t = Theme::defaults(30);
-        let mut text = TextEngine::new();
-        // no descenders, so the ink bottom is the baseline: padding below the baseline is what gets measured
-        let n = note(1, "Hi", "no descenders");
-        let w = t.card_w;
-        let h = 140;
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        let s = laid_out(&[n.clone()], 0, w, &t, &mut text);
-        {
-            let mut c = Canvas::new(&mut buf, w, h);
-            c.set_clip(Some(s.rect));
-            render(&mut c, &s.cards[0], 1.0, &n, &t, &mut text);
-        }
-        let ink_rows: Vec<i32> = (0..h)
-            .filter(|y| (0..w).any(|x| buf[((y * w + x) * 4) as usize] > 60))
-            .collect();
-        let last = *ink_rows.last().unwrap();
-        assert_eq!(last, s.rect.bottom() - t.card_padding - 1, "ink bottom must sit card_padding above the card's bottom edge");
-        let first = *ink_rows.first().unwrap();
-        let m = text.cap_metrics(&t.font);
-        assert_eq!(first, s.cards[0].summary + m.top.round() as i32, "the head summary sits on the bar's text line");
-    }
-
-    /// A card below the head one is padded from its own top edge, at both ends.
-    #[test]
-    fn a_lower_card_is_padded_at_both_ends() {
+    fn the_peek_pill_shows_the_next_notification_only() {
         let t = Theme::defaults(30);
         let mut text = TextEngine::new();
         let head = note(1, "Head", "");
-        let second = note(2, "Hi", "no descenders");
+        let second = note(2, "Next up", "");
         let w = t.card_w;
         let h = 200;
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let s = laid_out(&[head, second.clone()], 0, w, &t, &mut text);
-        let card = &s.cards[1];
+        let pill = s.cards[1].rect;
         {
             let mut c = Canvas::new(&mut buf, w, h);
             c.set_clip(Some(s.rect));
-            render(&mut c, card, 1.0, &second, &t, &mut text);
+            render(&mut c, &s.cards[1], 1.0, &second, &t, &mut text);
         }
-        let ink_rows: Vec<i32> = (0..h)
-            .filter(|y| (0..w).any(|x| buf[((y * w + x) * 4) as usize] > 60))
-            .collect();
-        assert_eq!(*ink_rows.first().unwrap(), card.rect.y + t.card_padding);
-        assert_eq!(*ink_rows.last().unwrap(), card.rect.bottom() - t.card_padding - 1);
+        let ink_rows: Vec<i32> = (0..h).filter(|y| (0..w).any(|x| buf[((y * w + x) * 4) as usize] > 60)).collect();
+        let m = text.cap_metrics(&t.font);
+        assert_eq!(s.cards[1].summary, text.optical_top(&t.font, pill.y, t.height), "cap-centred in the pill, like the bar's own line");
+        assert_eq!(*ink_rows.first().unwrap(), s.cards[1].summary + m.top.round() as i32);
+        assert!(*ink_rows.last().unwrap() < pill.bottom(), "one line of ink, inside the pill");
     }
 
     /// The stretch never moves sideways and never leaves the bar's row: y = 0 at every step, and a spring may
@@ -468,19 +501,34 @@ mod tests {
         assert!(t.card_w >= crate::theme::MIN_CARD_W && t.card_w <= crate::theme::MAX_CARD_W);
     }
 
-    /// The surface has to be tall enough for every frame of the animation; a card is at most
-    /// `MAX_BODY_LINES` body rows plus a summary and an action row.
+    /// The surface has to be tall enough for every frame of the animation: a head card is at most
+    /// `MAX_BODY_LINES` body rows plus a summary and an action row, and behind it there is one bar-tall pill.
     #[test]
-    fn max_tail_bounds_every_card() {
+    fn max_tail_bounds_the_stack() {
         let t = Theme::defaults(30);
-        let mut text = TextEngine::new();
         let body = (0..crate::notify::queue::MAX_BODY_LINES).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let mut n = note(1, "Subject", &body);
         n.actions = vec![("open".into(), "Open".into())];
-        let max_visible = 4;
-        let mut text2 = TextEngine::new();
-        let s = stack(&std::iter::repeat_n(n, max_visible).collect::<Vec<_>>(), 0, 1280, &t, &mut text);
+        let visible: Vec<_> = std::iter::repeat_n(n, 6).collect();
+        let mut text = TextEngine::new();
+        let mut bound_engine = TextEngine::new();
+        let s = stack(&visible, 0, 1280, &t, &mut text);
         let tail = s.rect.h - t.height;
-        assert!(tail <= max_tail(max_visible, &t, &mut text2), "stack tail {tail} vs bound {}", max_tail(max_visible, &t, &mut text2));
+        let bound = max_tail(&t, &mut bound_engine, None);
+        assert!(tail <= bound, "stack tail {tail} vs bound {bound}");
+    }
+
+    /// A tall bar must not push the stack into the middle of a short screen: the derived bound is capped at
+    /// `MAX_TAIL_PERCENT` of the output's height, and a shorter output gives a shorter surface.
+    #[test]
+    fn max_tail_is_capped_by_the_output_height() {
+        let t = Theme::defaults(120);
+        let mut text = TextEngine::new();
+        let derived = max_tail(&t, &mut text, None);
+        assert!(derived > 1080 * MAX_TAIL_PERCENT / 100, "the derived bound must exceed the cap, or this proves nothing: {derived}");
+        assert_eq!(max_tail(&t, &mut text, Some(1080)), 1080 * MAX_TAIL_PERCENT / 100);
+        assert!(max_tail(&t, &mut text, Some(720)) < max_tail(&t, &mut text, Some(2160)), "the cap follows the output");
+        // 0 or an unknown output is no usable height: no cap, rather than a zero-height surface.
+        assert_eq!(max_tail(&t, &mut text, Some(0)), derived);
     }
 }

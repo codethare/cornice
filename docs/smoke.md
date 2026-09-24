@@ -8,7 +8,7 @@ Each section states what it **can prove** and what it **cannot prove**. The firs
 cargo test
 ```
 
-Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine, and the notification column — its geometry, the stretch, hit testing and that it paints no background inside the bar.
+Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine, and the notification column — its geometry (the head card plus the collapsed peek pill), the stretch, hit testing, the output-height cap on the surface, and that it paints no background inside the bar.
 
 - **Proves**: pure logic has no regressions.
 - **Does not prove**: any pixels, any protocol behaviour.
@@ -75,10 +75,12 @@ logs, screenshots and the test config stay under `W`. Needs `grim`, `gcc`, `wayl
 Checks: bar band and height, left/center/right placement and the optical inset at the bar's rounded ends,
 a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), that a short card is drawn
 *inside* the bar while a long body stretches below it (one unbroken piece from the bar's row down, attaching where
-the pill's bottom edge is straight), that a second notification is its own card one `card_gap` below at the same
-width (macOS stacking), `expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed`
-reason 1, a replace stays put while a new id is still stretching (the spring is measured), `max_visible` stacking,
-card click → reason 2, action button → `ActionInvoked`, click-through on a transparent region, idle CPU, config
+the pill's bottom edge is straight), that a second notification collapses into one peek pill one `card_gap` below
+at the same width, carrying that notification's summary (macOS collapsing stack) and that a third does not lengthen
+the stack further, `expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed`
+reason 1, a replace stays put while a new id is still stretching (the spring is measured), that the drawn stack stays
+at the head card plus one pill however deep the queue is, card click → reason 2, action button → `ActionInvoked`,
+click-through on a transparent region, idle CPU, config
 errors with line numbers, and the two-output behaviour.
 
 - **Proves**: the whole checklist below except the two items marked *(human)* — on river + tailrace, with pixels and pointer input.
@@ -92,8 +94,8 @@ errors with line numbers, and the two-output behaviour.
       `[notification] enter_ms = 60000` and take a screenshot every second: the shape's top edge stays at the bar's
       top while its bottom edge walks down, and at no frame is there a lighter or darker band where the two meet
 - [ ] *(human)* The corners read as Apple's continuous (squircle) curve rather than a cut-off square, and the stack
-      reads as macOS: the head card attached to the bar, each later notification its own equally wide, equally round
-      card below it, with a visible gap between the cards
+      reads as macOS: the head card attached to the bar, and behind it one collapsed pill — one bar tall, the next
+      summary in the secondary colour — with a visible gap between the two
 - [ ] *(human)* `notify-send -r <id>` on a visible card updates it in place, without replaying the stretch
 - [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
       the left and right gaps should read the same (`docs/smoke.md`)

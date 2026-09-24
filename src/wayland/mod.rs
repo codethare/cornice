@@ -310,19 +310,29 @@ impl State {
         }
     }
 
-    /// The bar width (full width) of the output the notification surface should target.
-    fn notif_output_width(&self) -> Option<i32> {
-        self.notif_output
-            .as_ref()
-            .and_then(|o| self.bars.get(o))
-            .or_else(|| self.bars.values().next())
-            .map(|b| (b.width.max(1)) as i32)
+    /// The output the notification surface targets: the one it was created on, else the first that has a bar.
+    fn notif_target(&self) -> Option<wl_output::WlOutput> {
+        self.notif_output.clone().or_else(|| self.bars.keys().next().cloned())
     }
 
-    /// Notification surface height: the bar plus the worst-case tail of `max_visible` cards. It is sized once —
-    /// a resize per animation frame goes through a configure round-trip and would stutter the stretch.
+    /// The bar width (full width) of the output the notification surface should target.
+    fn notif_output_width(&self) -> Option<i32> {
+        self.notif_target().and_then(|o| self.bars.get(&o)).map(|b| (b.width.max(1)) as i32)
+    }
+
+    /// The output's logical height — the budget the notification stack borrows before it is capped.
+    /// `logical_size` needs zxdg-output; a compositor without it still advertises the current mode.
+    fn notif_output_height(&self) -> Option<i32> {
+        let info = self.output_state.info(&self.notif_target()?)?;
+        info.logical_size.or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions)).map(|(_, h)| h)
+    }
+
+    /// Notification surface height: the bar plus the worst-case tail of one card and one peek pill, capped by
+    /// the output (see `view::max_tail`). It is sized once — a resize per animation frame goes through a
+    /// configure round-trip and would stutter the stretch.
     fn notif_surface_height(&mut self) -> u32 {
-        let tail = crate::notify::view::max_tail(self.cfg.notification.max_visible, &self.theme, &mut self.text);
+        let output_h = self.notif_output_height();
+        let tail = crate::notify::view::max_tail(&self.theme, &mut self.text, output_h);
         let h = self.cfg.bar.margin + self.cfg.bar.height + tail;
         h.max(1) as u32
     }
@@ -418,12 +428,18 @@ impl State {
             .notif_stack(output_w)
             .filter(|_| !self.queue.is_empty())
             .map_or(Rect::new(start.x, 0, start.w, self.theme.height), |s| s.rect);
-        self.set_anim(Some(Anim {
-            kind: AnimKind::Exit,
-            tween: Tween::new(now, self.cfg.notification.exit_ms),
-            start,
-            end,
-        }));
+        if end == start {
+            // Nothing on screen moves: closing the peek pill, or an entry past the drawn pair, leaves the shape
+            // exactly where it is, so there is nothing to animate — only the new head/peek content to draw.
+            self.redraw_notifications(now);
+        } else {
+            self.set_anim(Some(Anim {
+                kind: AnimKind::Exit,
+                tween: Tween::new(now, self.cfg.notification.exit_ms),
+                start,
+                end,
+            }));
+        }
         if let Some(c) = &self.dbus {
             let _ = crate::notify::service::emit_closed(c, id, reason);
         }
