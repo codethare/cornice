@@ -1,7 +1,7 @@
 # cornice 设计文档
 
 日期:2026-09-19(v2 — v1 的 `river.*` 模块已删除,理由见 §2)
-状态:已确认(v3 — 通知信息层级按 Apple HIG 重定;代码已实施,像素待 smoke)
+状态:已确认(v4 — 在 Apple HIG 信息层级上补充内容节奏;代码已实施,像素待 smoke)
 
 ## 1. 目标
 
@@ -186,6 +186,7 @@ trait Module {
 
 - **操作按钮**:低透明度 accent 胶囊底 + accent 文字,不再用整块实色 accent;文字按 cap height 在按钮内居中。只绘制卡片内还能完整容纳的按钮,绘制矩形就是命中矩形。
 - **单行字段**:summary、`app_name`、action label 都只取第一行,再按剩余宽度截断;正文仍按既有 5 行 / 300 字符上限处理。它们都是 D-Bus 信任边界,不能让换行偷出行盒或按钮。
+- **内容节奏**:标题下出现正文或操作时,detail block 先从栏底边之外开始,留 `card_gap / 2`,再画一条厚度为 `max(card_gap / 3, 1)` 的低透明度 `secondary` 分隔线;分隔线后才是正文或按钮。短通知仍完全贴在栏内,不凭空增加分隔物。这是 Apple Live Activities 对“用 inset 容器或线分隔内容块”的直接落地。
 - **折叠预览**:窥视条除下一条 summary 外,最右侧用 accent 显示 `×N`,明确它代表多少条通知;`N` 包含队列中尚未进入 `max_visible` 的条目,summary 与计数都按剩余宽度截断。
 
 参考:[Notifications](https://developer.apple.com/design/human-interface-guidelines/notifications)、[Live Activities](https://developer.apple.com/design/human-interface-guidelines/live-activities)。规格决定信息层级,不要求复制 Apple 品牌资产或像素外观。
@@ -241,7 +242,7 @@ t=1   rect = 整叠(顶到栏顶,底到窥视条的底边)
 
 **关键耦合**:叠的 x/w 来自 `BarLayout` 里 `notification` 模块所占的槽位矩形。卡片宽度是**固定值** `card_w = clamp(10 × height, 80, 420)`(见 §5 的 Apple 比例),不随内容变化,所以首卡与窥视条等宽,而且栏的预留宽度在通知存续期间不再变。队列为空时宽 0,且**0 宽模块不占模块间距**,所以没有卡片时栏的其余模块不会移位。栏的布局结果就是通知模块的输入 —— 同一份数据,不重算。
 
-**首卡在栏里**:首卡(最新)的来源、summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);来源靠右且为次色,summary 靠左且为主色。只有放不下的行才向下拉伸。因此一条短通知整个都在栏里,栏下方什么都不画。
+**首卡在栏里**:首卡(最新)的来源、summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);来源靠右且为次色,summary 靠左且为主色。只有放不下的行才向下拉伸;正文或操作块与标题之间先出现派生间距和低对比度分隔线。因此一条短通知整个都在栏里,栏下方什么都不画。
 
 **卡片堆叠**:首卡之后**不再是一张一张的卡,而是一条折叠的窥视条**(macOS 的折叠栈):高度正好是栏高、圆角是 `radius`(即栏自己的紧凑形态),`card_gap` 挂在首卡下方。左侧画下一条通知的 summary(`secondary` 色),右侧用 accent 画 `×N`;两者按剩余宽度截断,不做正文与按钮。点它关掉那条通知,与其他卡一致。更后面的条目仍留在队列里,前面的消失后依次升上来。
 
@@ -288,6 +289,7 @@ docs/smoke.md                     手动验证清单
 - **tween**:t=0 等于起点、t=1 等于终点、进度单调、超出范围被 clamp
 - **通知状态机**:时长缺省表(-1 / 0 / urgency)、`replaces_id` 就地替换内容与来源、`max_visible` 溢出、关闭原因 1/2/3、超长截断
 - **命中**:按钮矩形 ↔ action 映射;超长 action label 的矩形始终留在卡片内
+- **内容节奏**:标题与正文/操作之间的派生间距、分隔线位置,以及仅有操作时的独立行布局
 
 协议层不做自动化测试(需要真实 compositor),改为 `docs/smoke.md` 中的手动清单。
 

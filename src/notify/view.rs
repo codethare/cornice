@@ -15,6 +15,7 @@ use crate::widget::Action;
 /// and the notification stack may borrow at most this share of it (see `max_tail`).
 const MAX_TAIL_PERCENT: i32 = 25;
 const ACTION_FILL_PERCENT: u16 = 22;
+const DIVIDER_ALPHA_PERCENT: u16 = 32;
 
 pub fn urgency_color(u: Urgency, theme: &Theme) -> Color {
     match u {
@@ -25,6 +26,9 @@ pub fn urgency_color(u: Urgency, theme: &Theme) -> Color {
 
 /// One line's advance; every row in a card steps by it.
 fn line_height(theme: &Theme) -> i32 { (theme.font.size * 1.35).ceil() as i32 }
+
+/// A separator thick enough to read at a glance while still following the card's spacing rhythm.
+fn divider_height(theme: &Theme) -> i32 { (theme.card_gap / 3).max(1) }
 
 /// Body rows a card draws. The queue already caps the body, but a hand-built `Notification` may exceed it.
 fn body_lines(n: &Notification) -> usize {
@@ -59,6 +63,8 @@ pub struct Card {
     pub summary: i32,
     /// Box top of the first body line.
     pub body: i32,
+    /// Separator between the headline and the first detail row.
+    pub divider: Option<i32>,
     /// The action row's pill top; the pill is one line tall.
     pub actions: Option<i32>,
     /// The collapsed peek pill: one bar tall with the next summary and the number it represents.
@@ -89,27 +95,42 @@ pub fn stack(visible: &[Notification], queued: usize, slot_x: i32, output_w: i32
     // stretches nowhere; once a row lands below the bar the card keeps its bottom padding, so it ends
     // `card_padding` below the last baseline.
     let summary = text.optical_top(&theme.font, 0, theme.height);
-    let mut next = summary; // box top of the row after the last one drawn
+    let mut body = summary + line;
+    let mut next = body; // box top of the row after the last one drawn
     let mut last_ink = summary + m.top.round() as i32 + m.cap.ceil() as i32; // ink bottom of the last row drawn
-    for _ in 0..body_lines(head) {
-        next += line;
-        last_ink = next + m.top.round() as i32 + m.cap.ceil() as i32;
+    let mut divider = None;
+    let body_rows = body_lines(head);
+    if body_rows > 0 {
+        next = next.max(theme.height);
+        next += theme.card_gap / 2;
+        divider = Some(next);
+        next += divider_height(theme);
+        body = next;
+        for _ in 0..body_rows {
+            last_ink = next + m.top.round() as i32 + m.cap.ceil() as i32;
+            next += line;
+        }
     }
     let actions = if head.actions.iter().any(|(_, label)| !first_line(label).trim().is_empty()) {
+        next = next.max(theme.height);
         next += theme.card_gap / 2;
+        if divider.is_none() {
+            divider = Some(next);
+            next += divider_height(theme);
+        }
         last_ink = next + line;
         Some(next)
     } else {
         None
     };
     let bottom = if last_ink <= theme.height { theme.height } else { last_ink + theme.card_padding };
-    cards.push(Card { rect: Rect::new(x, 0, w, bottom), summary, body: summary + line, actions, collapsed: None });
+    cards.push(Card { rect: Rect::new(x, 0, w, bottom), summary, body, divider, actions, collapsed: None });
     // The collapsed remainder: the bar's own compact shape — one bar tall, `radius` corners — carrying the next
     // notification's summary and the total count. Entries past it stay in the queue and slide in as the ones ahead go.
     if visible.len() > 1 {
         let y = bottom + theme.card_gap;
         let top = text.optical_top(&theme.font, y, theme.height);
-        cards.push(Card { rect: Rect::new(x, y, w, theme.height), summary: top, body: top, actions: None, collapsed: Some(queued.saturating_sub(1)) });
+        cards.push(Card { rect: Rect::new(x, y, w, theme.height), summary: top, body: top, divider: None, actions: None, collapsed: Some(queued.saturating_sub(1)) });
     }
     let h = cards.last().map_or(theme.height, |c| c.rect.bottom());
     Stack { rect: Rect::new(x, 0, w, h), cards }
@@ -174,6 +195,10 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, n: &Notification, th
     if !source.is_empty() {
         text.draw(canvas, &source, source_x, card.summary, &theme.font, fa(theme.secondary));
     }
+    if let Some(y) = card.divider {
+        let divider = Color::rgba(theme.secondary.r, theme.secondary.g, theme.secondary.b, (theme.secondary.a as u16 * DIVIDER_ALPHA_PERCENT / 100) as u8);
+        canvas.fill_rect(Rect::new(x, y, inner_w as i32, divider_height(theme)), fa(divider));
+    }
 
     let mut y = card.body;
     for body_line in n.body.lines().take(crate::notify::queue::MAX_BODY_LINES) {
@@ -230,7 +255,9 @@ pub fn stretch(start: Rect, end: Rect, easing: Easing, tw: &Tween, now: Instant)
 pub fn max_tail(theme: &Theme, text: &mut TextEngine, output_h: Option<i32>) -> i32 {
     let line = line_height(theme);
     let cap = text.cap_metrics(&theme.font).cap.ceil() as i32;
-    let worst_card = theme.card_padding * 2 + cap + line * (crate::notify::queue::MAX_BODY_LINES as i32 + 1) + theme.card_gap / 2;
+    let summary = text.optical_top(&theme.font, 0, theme.height);
+    let below_bar = (theme.height - summary - line).max(0);
+    let worst_card = theme.card_padding * 2 + cap + line * (crate::notify::queue::MAX_BODY_LINES as i32 + 1) + below_bar + theme.card_gap + divider_height(theme);
     let tail = worst_card + theme.card_gap + theme.height; // head card, gap, peek pill
     match output_h {
         Some(h) if h > 0 => tail.min(h * MAX_TAIL_PERCENT / 100),
@@ -277,6 +304,7 @@ mod tests {
         assert_eq!(head.rect.w, s.rect.w, "every card is the same width");
         // The summary sits on the bar's own text line, not on a card padding line.
         assert_eq!(head.summary, text.optical_top(&t.font, 0, t.height));
+        assert_eq!(head.divider, None, "a compact bar-only card has no detail separator");
     }
 
     /// "If it is too long, it stretches downwards": rows that do not fit in the bar extend the same card.
@@ -291,7 +319,10 @@ mod tests {
         let s = laid_out(&[n], 0, 1000, &t, &mut text);
         assert!(s.rect.h > t.height, "three body rows must not fit in a 30px bar: {s:?}");
         let head = &s.cards[0];
-        assert_eq!(head.body, head.summary + line, "body rows keep the text rhythm from the bar's line");
+        let divider = head.divider.expect("a body must have a separator");
+        assert_eq!(divider, (head.summary + line).max(t.height) + t.card_gap / 2, "the separator starts below the bar edge");
+        assert!(divider >= t.height, "the separator must not cut the bar's own row");
+        assert_eq!(head.body, divider + divider_height(&t), "body starts after the separator");
         assert_eq!(head.summary + ink_off, t.height / 2 - cap / 2, "the head summary is cap-centred on the bar's line");
         // The last row is the third body row: its ink bottom plus one card_padding is the card's bottom.
         assert_eq!(
@@ -541,6 +572,19 @@ mod tests {
     fn headline_fields_cannot_add_visual_rows() {
         assert_eq!(first_line("title\nspoofed second row"), "title");
         assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn action_only_card_starts_below_the_headline() {
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let mut n = note(1, "Subject", "");
+        n.actions = vec![("open".into(), "Open".into())];
+        let s = laid_out(&[n], 0, t.card_w, &t, &mut text);
+        let card = &s.cards[0];
+        let action = card.actions.expect("an action reserves a row");
+        assert!(action >= t.height, "the action block starts below the bar edge");
+        assert!(card.divider.is_some(), "the action block is separated from the headline");
     }
 
     #[test]

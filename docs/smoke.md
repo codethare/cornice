@@ -8,7 +8,7 @@ Each section states what it **can prove** and what it **cannot prove**. The firs
 cargo test
 ```
 
-Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine (including replacement of its source label), and the notification column — first-line sanitising for untrusted headline fields, the collapsed count, action hit rects bounded by the card, the head card plus peek geometry, the stretch, the output-height cap on the surface, and that the head paints no background inside the bar.
+Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine (including replacement of its source label), and the notification column — first-line sanitising for untrusted headline fields, the collapsed count, action hit rects bounded by the card, the derived headline/detail separator, action-only layout, the head card plus peek geometry, the stretch, the output-height cap on the surface, and that the head paints no background inside the bar.
 
 - **Proves**: pure logic has no regressions.
 - **Does not prove**: any pixels, any protocol behaviour.
@@ -97,7 +97,8 @@ errors with line numbers, and the two-output behaviour.
       reads as macOS: the head card attached to the bar, and behind it one collapsed pill — one bar tall, the next
       summary in the secondary colour and `×N` in accent — with a visible gap between the two
 - [ ] *(human)* The head title remains the strongest label on its line, with the shorter source label quiet at the
-      trailing edge; action labels stay centred inside quiet accent capsules, and overlong labels cannot escape them
+      trailing edge; body and action blocks sit below a restrained separator, action labels stay centred inside quiet
+      accent capsules, and overlong labels cannot escape them
 - [ ] *(human)* `notify-send -r <id>` on a visible card updates it in place, without replaying the stretch
 - [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
       the left and right gaps should read the same (`docs/smoke.md`)
