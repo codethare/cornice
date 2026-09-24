@@ -1,7 +1,7 @@
 # cornice 设计文档
 
 日期:2026-09-19(v2 — v1 的 `river.*` 模块已删除,理由见 §2)
-状态:已确认,待写实施计划
+状态:已确认(v3 — 通知信息层级按 Apple HIG 重定;代码已实施,像素待 smoke)
 
 ## 1. 目标
 
@@ -180,6 +180,16 @@ trait Module {
 - **文本按 cap height 定位**:行盒包含 cap 之上的行距和 baseline 之下的降部空间,而 `09:19` 这类字符串一个像素都用不到,所以“把行盒居中/按行盒加内边距”会差 `(line_height - cap)/2`。UI 里每一行文字都按 cap 居中(`TextEngine::optical_top`):栏内文字在自己的行里,通知的首卡与窥视条和栏共用同一条线,正文行从那条线按行距往下排。字体度量由首帧光栅化一个 `H` 量出并缓存(`TextEngine::cap_metrics`)。
 - **标题用主色、正文用次色**:Apple 的通知标题是主标签、正文是次标签(`secondary`= foreground × 0.72)。**没用 semibold**:请求的字重会落到配置家族之外(实测 `monospace` 下 `"Card 6"` 从 33.4px 变成 53.6px),反而拆掉了等宽网格，所以层次靠颜色而不是字重。
 
+### 通知信息层级(按 Apple HIG 重定)
+
+[Notifications](https://developer.apple.com/design/human-interface-guidelines/notifications) 要求通知能在余光中识别来源与标题,内容简洁,操作只保留能直接完成任务的按钮。cornice 不支持应用图标,因此不伪造图标:`app_name` 放在标题行最右侧,以 `secondary` 显示并最多占卡片内容宽的 1/3;summary 留在左侧、以主标签色显示,始终比来源更醒目。空 `app_name` 不占位。`app_name` 是客户端自报文本,只作来源提示,不当作可信身份。
+
+- **操作按钮**:低透明度 accent 胶囊底 + accent 文字,不再用整块实色 accent;文字按 cap height 在按钮内居中。只绘制卡片内还能完整容纳的按钮,绘制矩形就是命中矩形。
+- **单行字段**:summary、`app_name`、action label 都只取第一行,再按剩余宽度截断;正文仍按既有 5 行 / 300 字符上限处理。它们都是 D-Bus 信任边界,不能让换行偷出行盒或按钮。
+- **折叠预览**:窥视条除下一条 summary 外,最右侧用 accent 显示 `×N`,明确它代表多少条通知;`N` 包含队列中尚未进入 `max_visible` 的条目,summary 与计数都按剩余宽度截断。
+
+参考:[Notifications](https://developer.apple.com/design/human-interface-guidelines/notifications)、[Live Activities](https://developer.apple.com/design/human-interface-guidelines/live-activities)。规格决定信息层级,不要求复制 Apple 品牌资产或像素外观。
+
 ## 6. 通知子系统
 
 ### D-Bus 接口
@@ -194,8 +204,8 @@ trait Module {
 
 - **hints**:只认 `urgency`(0/1/2,决定配色与缺省时长);其余忽略且不报错。
 - **时长**:`expire_timeout = -1` 用缺省(low 4s / normal 6s / critical 不自动消失);`0` 永不自动消失但仍可点击关闭;`>0` 照用。
-- **`replaces_id`**:命中已有条目则就地替换内容(不重放形变),否则新建。
-- **截断**:正文超长按行数与字符数截断并加省略号。这是信任边界,必须做。
+- **`replaces_id`**:命中已有条目则就地替换内容与来源(不重放形变),否则新建。
+- **来源与截断**:`app_name` 用作标题行尾部的次级来源标签;summary、来源与 action label 都只取第一行并按卡片宽度截断。正文超长按行数与字符数截断并加省略号。这是信任边界,必须做。
 - **队列**:按新→旧排序,`max_visible` 之外的不绘制但保留,前方消失后依次滑入;溢出丢弃最旧。
 - **关闭原因**:1 = 超时,2 = 用户关闭,3 = `CloseNotification`。
 
@@ -203,7 +213,7 @@ trait Module {
 
 ### 输入
 
-左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点按钮 = `ActionInvoked` + 关闭。栏内那一行文字也是卡片的一部分,点它也关闭卡片。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
+左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点低透明度 accent 按钮 = `ActionInvoked` + 关闭。栏内那一行文字也是卡片的一部分,点它也关闭卡片。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
 
 ### 降级
 
@@ -231,9 +241,9 @@ t=1   rect = 整叠(顶到栏顶,底到窥视条的底边)
 
 **关键耦合**:叠的 x/w 来自 `BarLayout` 里 `notification` 模块所占的槽位矩形。卡片宽度是**固定值** `card_w = clamp(10 × height, 80, 420)`(见 §5 的 Apple 比例),不随内容变化,所以首卡与窥视条等宽,而且栏的预留宽度在通知存续期间不再变。队列为空时宽 0,且**0 宽模块不占模块间距**,所以没有卡片时栏的其余模块不会移位。栏的布局结果就是通知模块的输入 —— 同一份数据,不重算。
 
-**首卡在栏里**:首卡(最新)的 summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);只有放不下的行才向下拉伸。因此一条短通知整个都在栏里,栏下方什么都不画。
+**首卡在栏里**:首卡(最新)的来源、summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);来源靠右且为次色,summary 靠左且为主色。只有放不下的行才向下拉伸。因此一条短通知整个都在栏里,栏下方什么都不画。
 
-**卡片堆叠**:首卡之后**不再是一张一张的卡,而是一条折叠的窥视条**(macOS 的折叠栈):高度正好是栏高、圆角是 `radius`(即栏自己的紧凑形态),`card_gap` 挂在首卡下方,里面只画下一条通知的 summary(`secondary` 色,按卡片内宽截断,不做正文与按钮)。点它关掉那条通知,与其他卡一致。更后面的条目仍留在队列里,前面的消失后依次升上来。
+**卡片堆叠**:首卡之后**不再是一张一张的卡,而是一条折叠的窥视条**(macOS 的折叠栈):高度正好是栏高、圆角是 `radius`(即栏自己的紧凑形态),`card_gap` 挂在首卡下方。左侧画下一条通知的 summary(`secondary` 色),右侧用 accent 画 `×N`;两者按剩余宽度截断,不做正文与按钮。点它关掉那条通知,与其他卡一致。更后面的条目仍留在队列里,前面的消失后依次升上来。
 
 **退化情况**:未配置 `notification` 模块时不绘制卡片(守护进程照常运行);队列为空时不创建 overlay surface。
 
@@ -276,8 +286,8 @@ docs/smoke.md                     手动验证清单
 - **文字**:按宽度截断加省略号(注入假测量函数)
 - **exec**:`{out}` 模板替换、子进程退出后重启
 - **tween**:t=0 等于起点、t=1 等于终点、进度单调、超出范围被 clamp
-- **通知状态机**:时长缺省表(-1 / 0 / urgency)、`replaces_id` 就地替换、`max_visible` 溢出、关闭原因 1/2/3、超长截断
-- **命中**:按钮矩形 ↔ action 映射
+- **通知状态机**:时长缺省表(-1 / 0 / urgency)、`replaces_id` 就地替换内容与来源、`max_visible` 溢出、关闭原因 1/2/3、超长截断
+- **命中**:按钮矩形 ↔ action 映射;超长 action label 的矩形始终留在卡片内
 
 协议层不做自动化测试(需要真实 compositor),改为 `docs/smoke.md` 中的手动清单。
 

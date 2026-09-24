@@ -14,6 +14,7 @@ use crate::widget::Action;
 /// spans 47.7° horizontally but only 28.0° vertically, so on a 16:9 output the vertical axis is the scarce one
 /// and the notification stack may borrow at most this share of it (see `max_tail`).
 const MAX_TAIL_PERCENT: i32 = 25;
+const ACTION_FILL_PERCENT: u16 = 22;
 
 pub fn urgency_color(u: Urgency, theme: &Theme) -> Color {
     match u {
@@ -29,6 +30,9 @@ fn line_height(theme: &Theme) -> i32 { (theme.font.size * 1.35).ceil() as i32 }
 fn body_lines(n: &Notification) -> usize {
     if n.body.is_empty() { 0 } else { n.body.lines().count().min(crate::notify::queue::MAX_BODY_LINES) }
 }
+
+/// A headline field or action is one visual row even when an untrusted client embeds a newline in it.
+fn first_line(text: &str) -> &str { text.lines().next().unwrap_or("") }
 
 /// Width the bar reserves for the notification module: one card, 0 while nothing is visible. Every card is the
 /// same size — Apple's expanded Live Activity is a fixed 371×84–160 pt rather than a shrink-wrap of its content —
@@ -57,8 +61,8 @@ pub struct Card {
     pub body: i32,
     /// The action row's pill top; the pill is one line tall.
     pub actions: Option<i32>,
-    /// The collapsed peek pill: one bar tall, summary only, `theme.radius` corners. Only the first card is not one.
-    pub peek: bool,
+    /// The collapsed peek pill: one bar tall with the next summary and the number it represents.
+    pub collapsed: Option<usize>,
 }
 
 /// The stack: the head card hanging off the bar, and behind it the collapsed peek pill.
@@ -72,8 +76,8 @@ pub struct Stack {
 /// Lay the visible notifications out: the head card, plus one collapsed peek pill for everything behind it.
 /// The head card's summary shares the bar's text line, so only the rows that do not fit in the bar stretch below
 /// it; a separate full card per notification would grow the stack along the screen's scarce axis (see
-/// `MAX_TAIL_PERCENT`), so everything past the first is one pill that says which notification is next.
-pub fn stack(visible: &[Notification], slot_x: i32, output_w: i32, theme: &Theme, text: &mut TextEngine) -> Stack {
+/// `MAX_TAIL_PERCENT`), so everything past the first is one pill that previews the next notification and counts the remainder.
+pub fn stack(visible: &[Notification], queued: usize, slot_x: i32, output_w: i32, theme: &Theme, text: &mut TextEngine) -> Stack {
     let (x, w) = straight_band(slot_x, theme.card_w, output_w, theme);
     let line = line_height(theme);
     let m = text.cap_metrics(&theme.font);
@@ -91,21 +95,21 @@ pub fn stack(visible: &[Notification], slot_x: i32, output_w: i32, theme: &Theme
         next += line;
         last_ink = next + m.top.round() as i32 + m.cap.ceil() as i32;
     }
-    let actions = if head.actions.is_empty() {
-        None
-    } else {
+    let actions = if head.actions.iter().any(|(_, label)| !first_line(label).trim().is_empty()) {
         next += theme.card_gap / 2;
         last_ink = next + line;
         Some(next)
+    } else {
+        None
     };
     let bottom = if last_ink <= theme.height { theme.height } else { last_ink + theme.card_padding };
-    cards.push(Card { rect: Rect::new(x, 0, w, bottom), summary, body: summary + line, actions, peek: false });
+    cards.push(Card { rect: Rect::new(x, 0, w, bottom), summary, body: summary + line, actions, collapsed: None });
     // The collapsed remainder: the bar's own compact shape — one bar tall, `radius` corners — carrying the next
-    // notification's summary. Entries past it stay in the queue and slide in as the ones ahead of them go.
+    // notification's summary and the total count. Entries past it stay in the queue and slide in as the ones ahead go.
     if visible.len() > 1 {
         let y = bottom + theme.card_gap;
         let top = text.optical_top(&theme.font, y, theme.height);
-        cards.push(Card { rect: Rect::new(x, y, w, theme.height), summary: top, body: top, actions: None, peek: true });
+        cards.push(Card { rect: Rect::new(x, y, w, theme.height), summary: top, body: top, actions: None, collapsed: Some(queued.saturating_sub(1)) });
     }
     let h = cards.last().map_or(theme.height, |c| c.rect.bottom());
     Stack { rect: Rect::new(x, 0, w, h), cards }
@@ -122,7 +126,7 @@ pub fn render_card_background(canvas: &mut Canvas, card: &Card, head: bool, bar_
         return;
     }
     // The peek pill is the bar's shape, not a card: one bar tall, so `theme.radius` — a capsule — closes it.
-    let r = if card.peek { theme.radius } else { theme.card_radius };
+    let r = if card.collapsed.is_some() { theme.radius } else { theme.card_radius };
     // Shifting the shape up by `r` puts its top corners above the clip, so an attached card keeps straight sides
     // where it meets the bar while its bottom corners are as round as the shape language wants.
     let shape = if head { Rect::new(card.rect.x, card.rect.y - r, card.rect.w, card.rect.h + r) } else { card.rect };
@@ -141,40 +145,63 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, n: &Notification, th
     let fa = |c: Color| Color::rgba(c.r, c.g, c.b, (c.a as f32 * alpha.clamp(0.0, 1.0)) as u8);
     let line = line_height(theme);
     let x = card.rect.x + theme.card_padding;
-    // Inner width: all text is truncated to the card; summary is untrusted D-Bus input and must be truncated.
-    let inner_w = (card.rect.w - theme.card_padding * 2).max(0) as f32;
+    let right = card.rect.right() - theme.card_padding;
+    let inner_w = (right - x).max(0) as f32;
 
-    // The peek pill is not a card: no body and no buttons, the summary in the secondary colour, and it is a
-    // pointer at the next notification rather than the label the user is meant to read in place.
-    if card.peek {
-        let s = crate::text::truncate_to_width(&n.summary, inner_w, |t: &str| text.measure(t, &theme.font).0);
-        text.draw(canvas, &s, x, card.summary, &theme.font, fa(theme.secondary));
+    // The collapsed stack previews the next notification and keeps an explicit count, so a deep queue never
+    // looks like a single undifferentiated card.
+    if let Some(remaining) = card.collapsed {
+        let count = format!("×{remaining}");
+        let count = crate::text::truncate_to_width(&count, inner_w, |t: &str| text.measure(t, &theme.font).0);
+        let count_w = text.measure(&count, &theme.font).0.ceil() as i32;
+        let count_x = right - count_w;
+        let summary_w = (count_x - theme.card_gap - x).max(0) as f32;
+        let summary = crate::text::truncate_to_width(first_line(&n.summary), summary_w, |t: &str| text.measure(t, &theme.font).0);
+        text.draw(canvas, &summary, x, card.summary, &theme.font, fa(theme.secondary));
+        text.draw(canvas, &count, count_x, card.summary, &theme.font, fa(theme.accent));
         return Vec::new();
     }
 
-    // Apple's notification anatomy: the title in the primary label colour, the body in the secondary one.
-    let summary = crate::text::truncate_to_width(&n.summary, inner_w, |t: &str| text.measure(t, &theme.font).0);
+    // The source label takes the place of the app icon cornice cannot render. It stays quiet and yields the
+    // title most of the row, matching Apple's title-first hierarchy without competing with the headline.
+    let source = first_line(n.app_name.trim());
+    let source = crate::text::truncate_to_width(source, inner_w / 3.0, |t: &str| text.measure(t, &theme.font).0);
+    let source_w = if source.is_empty() { 0 } else { text.measure(&source, &theme.font).0.ceil() as i32 };
+    let source_x = right - source_w;
+    let summary_w = if source.is_empty() { inner_w } else { (source_x - theme.card_gap - x).max(0) as f32 };
+    let summary = crate::text::truncate_to_width(first_line(&n.summary), summary_w, |t: &str| text.measure(t, &theme.font).0);
     text.draw(canvas, &summary, x, card.summary, &theme.font, fa(urgency_color(n.urgency, theme)));
+    if !source.is_empty() {
+        text.draw(canvas, &source, source_x, card.summary, &theme.font, fa(theme.secondary));
+    }
+
     let mut y = card.body;
     for body_line in n.body.lines().take(crate::notify::queue::MAX_BODY_LINES) {
-        let t = crate::text::truncate_to_width(body_line, inner_w, |t: &str| text.measure(t, &theme.font).0);
-        text.draw(canvas, &t, x, y, &theme.font, fa(theme.secondary));
+        let body = crate::text::truncate_to_width(body_line, inner_w, |t: &str| text.measure(t, &theme.font).0);
+        text.draw(canvas, &body, x, y, &theme.font, fa(theme.secondary));
         y += line;
     }
 
     let mut hits = Vec::new();
     if let Some(ay) = card.actions {
+        let action_pad = (theme.card_padding / 2).max(2);
+        let fill = Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, (theme.accent.a as u16 * ACTION_FILL_PERCENT / 100) as u8);
         let mut bx = x;
         for (key, label) in &n.actions {
-            let t = crate::text::truncate_to_width(label, inner_w, |t: &str| text.measure(t, &theme.font).0);
-            let (w, _) = text.measure(&t, &theme.font);
-            // The pill is one line tall, so Apple's concentric rule (inner radius = outer radius − margin) clamps
-            // to a capsule here anyway — the shape Apple's own short buttons take.
-            let br = Rect::new(bx, ay, (w.ceil() as i32 + theme.card_padding).min(card.rect.w).max(0), line);
-            canvas.fill_rounded_rect(br, line / 2, theme.accent);
-            // The label is centred in the pill by its cap, not by its line box, like the bar's text.
+            let label = first_line(label).trim();
+            let available = right - bx;
+            if label.is_empty() {
+                continue;
+            }
+            if available < line + action_pad * 2 {
+                break;
+            }
+            let label = crate::text::truncate_to_width(label, (available - action_pad * 2) as f32, |t: &str| text.measure(t, &theme.font).0);
+            let label_w = text.measure(&label, &theme.font).0.ceil() as i32;
+            let br = Rect::new(bx, ay, (label_w + action_pad * 2).min(available), line);
+            canvas.fill_rounded_rect(br, line / 2, fill);
             let ty = text.optical_top(&theme.font, br.y, br.h);
-            text.draw(canvas, &t, bx + theme.card_padding / 2, ty, &theme.font, fa(theme.background));
+            text.draw(canvas, &label, bx + (br.w - label_w) / 2, ty, &theme.font, fa(theme.accent));
             hits.push((br, Action::NotificationAction { id: n.id, key: key.clone() }));
             bx = br.right() + theme.card_gap;
         }
@@ -218,6 +245,7 @@ mod tests {
     fn note(id: u32, summary: &str, body: &str) -> Notification {
         Notification {
             id,
+            app_name: "Test".into(),
             summary: summary.into(),
             body: body.into(),
             urgency: Urgency::Normal,
@@ -228,7 +256,7 @@ mod tests {
     }
 
     fn laid_out(visible: &[Notification], slot_x: i32, output_w: i32, theme: &Theme, text: &mut TextEngine) -> Stack {
-        stack(visible, slot_x, output_w, theme, text)
+        stack(visible, visible.len(), slot_x, output_w, theme, text)
     }
 
     /// Full width of the stack's slot, as the bar would lay it out for a right-section module.
@@ -308,10 +336,11 @@ mod tests {
         let t = Theme::defaults(30);
         let mut text = TextEngine::new();
         let notes: Vec<Notification> = (0..6).map(|i| note(i + 1, &format!("Card {i}"), "body")).collect();
-        let s = laid_out(&notes, 0, 1000, &t, &mut text);
+        let s = stack(&notes[..2], notes.len(), 0, 1000, &t, &mut text);
         assert_eq!(s.cards.len(), 2, "the head card and one pill, however long the queue");
         let (head, peek) = (&s.cards[0], &s.cards[1]);
-        assert!(!head.peek && peek.peek);
+        assert_eq!(head.collapsed, None);
+        assert_eq!(peek.collapsed, Some(5), "the pill represents every notification behind the head");
         assert_eq!(peek.rect.y, head.rect.bottom() + t.card_gap, "the pill hangs one card_gap below the head card");
         assert_eq!(peek.rect.h, t.height, "the pill is the bar's own compact shape");
         assert_eq!(peek.rect.w, head.rect.w, "the pill is as wide as the card it hangs under");
@@ -428,7 +457,7 @@ mod tests {
 
     /// macOS collapses the stack behind the head card, so the gap between the two shapes is background.
     #[test]
-    fn the_peek_pill_shows_the_next_notification_only() {
+    fn the_peek_pill_shows_the_next_notification_and_count() {
         let t = Theme::defaults(30);
         let mut text = TextEngine::new();
         let head = note(1, "Head", "");
@@ -438,6 +467,7 @@ mod tests {
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let s = laid_out(&[head, second.clone()], 0, w, &t, &mut text);
         let pill = s.cards[1].rect;
+        assert_eq!(s.cards[1].collapsed, Some(1), "one notification is hidden behind the head");
         {
             let mut c = Canvas::new(&mut buf, w, h);
             c.set_clip(Some(s.rect));
@@ -488,6 +518,43 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_action_labels_stay_inside_the_card() {
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let mut n = note(1, "Subject", "body");
+        n.actions = (0..4).map(|i| (format!("action-{i}"), "x".repeat(200))).collect();
+        let w = t.card_w;
+        let mut buf = vec![0u8; (w * 160 * 4) as usize];
+        let s = laid_out(&[n.clone()], 0, w, &t, &mut text);
+        let hits = {
+            let mut canvas = Canvas::new(&mut buf, w, 160);
+            render(&mut canvas, &s.cards[0], 1.0, &n, &t, &mut text)
+        };
+        let card = s.cards[0].rect;
+        assert!(!hits.is_empty(), "at least one short action label must still be offered");
+        let action_pad = (t.card_padding / 2).max(2);
+        assert!(hits.iter().all(|(r, _)| r.x >= card.x + t.card_padding && r.right() <= card.right() - t.card_padding));
+        assert!(hits.iter().all(|(r, _)| r.w >= line_height(&t) + action_pad * 2), "a fitted button must still have room for its label");
+    }
+
+    #[test]
+    fn headline_fields_cannot_add_visual_rows() {
+        assert_eq!(first_line("title\nspoofed second row"), "title");
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn empty_actions_do_not_reserve_a_row() {
+        let t = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let mut n = note(1, "Subject", "");
+        n.actions = vec![("empty".into(), "\n".into())];
+        let s = laid_out(&[n], 0, t.card_w, &t, &mut text);
+        assert_eq!(s.cards[0].actions, None);
+        assert_eq!(s.rect.h, t.height);
+    }
+
+    #[test]
     fn the_card_is_one_derived_size() {
         let t = Theme::defaults(30);
         // The bar reserves one card while anything is visible, and nothing at all while the queue is empty.
@@ -512,7 +579,7 @@ mod tests {
         let visible: Vec<_> = std::iter::repeat_n(n, 6).collect();
         let mut text = TextEngine::new();
         let mut bound_engine = TextEngine::new();
-        let s = stack(&visible, 0, 1280, &t, &mut text);
+        let s = stack(&visible, visible.len(), 0, 1280, &t, &mut text);
         let tail = s.rect.h - t.height;
         let bound = max_tail(&t, &mut bound_engine, None);
         assert!(tail <= bound, "stack tail {tail} vs bound {bound}");

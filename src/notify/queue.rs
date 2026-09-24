@@ -8,6 +8,7 @@ pub enum Urgency { Low, Normal, Critical }
 #[derive(Clone, Debug)]
 pub struct Notification {
     pub id: u32,
+    pub app_name: String,
     pub summary: String,
     pub body: String,
     pub urgency: Urgency,
@@ -19,7 +20,7 @@ pub struct Notification {
 
 #[derive(Clone, Debug)]
 pub enum Request {
-    Notify { id: u32, replaces_id: u32, summary: String, body: String, actions: Vec<(String, String)>, urgency: Urgency, expire_timeout: i32 },
+    Notify { id: u32, replaces_id: u32, app_name: String, summary: String, body: String, actions: Vec<(String, String)>, urgency: Urgency, expire_timeout: i32 },
     Close { id: u32 },
 }
 
@@ -69,6 +70,7 @@ impl Queue {
     }
 
     pub fn visible(&self) -> &[Notification] { &self.items[..self.items.len().min(self.max_visible)] }
+    pub fn len(&self) -> usize { self.items.len() }
     pub fn get(&self, id: u32) -> Option<&Notification> { self.items.iter().find(|n| n.id == id) }
     pub fn is_empty(&self) -> bool { self.items.is_empty() }
 
@@ -79,9 +81,9 @@ impl Queue {
 
     pub fn apply(&mut self, req: Request, now: Instant) -> Outcome {
         match req {
-            Request::Notify { id, replaces_id, summary, body, actions, urgency, expire_timeout } => {
+            Request::Notify { id, replaces_id, app_name, summary, body, actions, urgency, expire_timeout } => {
                 let expire = if expire_timeout < 0 { default_timeout(urgency) } else if expire_timeout == 0 { None } else { Some(Duration::from_millis(expire_timeout as u64)) };
-                let updated = Notification { id, summary, body: truncate_body(&body), urgency, expire, actions, created: now };
+                let updated = Notification { id, app_name, summary, body: truncate_body(&body), urgency, expire, actions, created: now };
                 if replaces_id != 0 {
                     if let Some(slot) = self.items.iter_mut().find(|n| n.id == replaces_id) {
                         let kept_id = slot.id;
@@ -131,6 +133,7 @@ mod tests {
         Request::Notify {
             id,
             replaces_id: replaces,
+            app_name: format!("app{id}"),
             summary: format!("s{id}"),
             body: "b".into(),
             actions: vec![],
@@ -149,8 +152,8 @@ mod tests {
     /// Same as `notify`, but with an explicit `expire_timeout`.
     fn notify_t(id: u32, replaces: u32, expire_timeout: i32) -> Request {
         match notify(id, replaces) {
-            Request::Notify { id, replaces_id, summary, body, actions, urgency, .. } =>
-                Request::Notify { id, replaces_id, summary, body, actions, urgency, expire_timeout },
+            Request::Notify { id, replaces_id, app_name, summary, body, actions, urgency, .. } =>
+                Request::Notify { id, replaces_id, app_name, summary, body, actions, urgency, expire_timeout },
             _ => unreachable!(),
         }
     }
@@ -186,6 +189,7 @@ mod tests {
         assert_eq!(out, Outcome::Replaced(1));
         assert_eq!(q.visible().len(), 2);
         assert_eq!(q.get(1).unwrap().summary, "new");
+        assert_eq!(q.get(1).unwrap().app_name, "app9", "replacement also refreshes the visible source label");
         // replacing does not move it (after notify(1), notify(2) takes the head, so id=1 is still at index 1)
         assert_eq!(q.visible()[1].id, 1);
     }

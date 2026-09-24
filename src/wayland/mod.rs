@@ -341,6 +341,7 @@ impl State {
     /// `None` when the module is not configured, which is what turns the notification cards off entirely.
     fn notif_stack(&mut self, output_w: i32) -> Option<crate::notify::view::Stack> {
         let at = self.sections.notif_at()?;
+        let queued = self.queue.len();
         let w = crate::notify::view::slot_width(self.queue.visible(), &self.theme);
         if w != self.sections.notif_width() {
             // The card's width is reserved in the bar, so the bar re-lays out with it.
@@ -350,7 +351,7 @@ impl State {
         let widths = self.sections.widths(&mut self.text, &self.theme);
         let bar = crate::bar::layout(&widths, output_w, &self.theme);
         let slot = bar.slot(at)?;
-        Some(crate::notify::view::stack(self.queue.visible(), slot.x, output_w, &self.theme, &mut self.text))
+        Some(crate::notify::view::stack(self.queue.visible(), queued, slot.x, output_w, &self.theme, &mut self.text))
     }
 
     /// Make sure the notification surface exists while the queue is non-empty or a leave animation is running.
