@@ -1,112 +1,108 @@
 # cornice 设计文档
 
-日期:2026-09-19(v2 — v1 的 `river.*` 模块已删除,理由见 §2)
-状态:已确认(v5 — 通知 surface 使用焦点 output 的 layer-shell default;代码已实施,像素待 smoke)
+日期:2026-09-25(v6 — 通知改为 bar 外的独立卡片列)
+状态:已确认(用户已选择纵向独立列;代码实施中)
 
 ## 1. 目标
 
-一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。通知以"从右侧栏组件变形生长出来"的方式出现在右上角,模仿 iOS 灵动岛。
+一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。
 
-首要目标是 river 窗口管理器上的可用性,但代码不包含任何 river 专有分支。
+通知不再插入 bar 的某个模块槽位,也不再从 bar 材质向下拉伸。通知显示在 bar 外侧下方,每条通知是一张独立卡片;多条通知按新 → 旧纵向排列,整列可以锚定在屏幕左上、中上或右上。卡片形状、间距、材质和动效参考 macOS 27 Golden Gate 的 Liquid Glass 设计语言,但使用 cornice 自己的比例和纯软件渲染能力。
 
-### 非目标(v1 明确不做)
+### 非目标
 
-- **tags / workspace / layout / mode / 聚焦窗口标题**(结构上不可得,见 §2)
-- 图标 / 图片通知(`icon-static`、`image-path`、hicolor 主题查找、PNG 解码)
-- `body-markup` 解析,以及声音
-- DND 开关、通知历史中心
-- 点击标签切换 workspace
-- GPU 渲染、模糊/阴影过渡
-- 插件系统、脚本语言的配置、布局语言
+- **tags / workspace / layout / mode / 聚焦窗口标题**(现代 river 不会向普通 bar 暴露这些状态,见 §2)
+- 图标 / 图片通知(`icon-static`、`image-path`、主题图标查找、PNG 解码)
+- `body-markup`、声音、DND 开关、通知历史中心
+- GPU 渲染、实时模糊、折射滤镜或阴影
+- 插件系统、布局语言、多个通知列
+- macOS 品牌资产或逐像素复刻
 
 ## 2. 已验证的前提
 
 ### river 与 WM 的职责划分
 
-- river 是**非单体**合成器:窗口管理由独立进程(WM)通过 `river-window-management-v1` 实现。
-- river **不向普通客户端暴露** `wlr-layer-shell-unstable-v1`。层壳客户端在 river 上能工作,前提是 **WM** 实现了 `river-layer-shell-v1`(由 WM 声明"我来处理层壳")。
-- river 官方 wiki 的软件列表对 mako / fuzzel / swaybg / eww 等逐条标注 "require the window manager to implement the river-layer-shell-v1 protocol"。
-
-### 目标 WM:tailrace
-
-- 目标运行时是 **river(最新,≥0.4.6)+ tailrace**(<https://github.com/codethare/tailrace>),不是 kwm。
-- tailrace **实现了 `river-layer-shell-v1`**:vendored `protocol/river-layer-shell-v1.xml`,`src/seat.rs` 处理 exclusive / non-exclusive layer-shell 焦点。
-- tailrace 在焦点 output 上调用 `river_layer_shell_output_v1.set_default`;因此普通 `wlr-layer-shell` 客户端把 output 传 `null` 时,合成器会把新 surface 放到当前焦点 output。cornice 不绑定任何 `river.*` 协议,只使用这个标准 layer-shell 的默认行为。
-- tailrace 源码中**没有任何 wl_shm 或渲染代码** —— 层壳 surface 由 **river 自己合成**,WM 只负责焦点与策略。
-- 结论:cornice 作为普通 `wlr-layer-shell` 客户端,在 river + tailrace 上可正常出图,不依赖 WM 的渲染能力。
-
-### 为什么没有 `river.*` 模块
-
-v1 的 spec 里计划了 `river.tags` / `river.title` / `river.layout` / `river.mode`,依赖 `river-status-unstable-v1`。该协议**只存在于 river-classic**,当前 river 里已经没有了:
-
-1. river 的 `protocol/` 目录只有:`river-input-management-v1`、`river-layer-shell-v1`、`river-libinput-config-v1`、`river-touch-gestures-v1`、`river-window-management-v1`、`river-xkb-bindings-v1`、`river-xkb-config-v1`。
-2. waybar 的 `river/tags` 在新 river 上直接报 `river_status_manager_v1 not advertised`。
-3. `ext-workspace-v1` 是尚未实现的 feature request(river#1402,2026-03 开)。
-4. tailrace 的 `protocol/` 里没有面向普通客户端的 workspace/focus 状态流;它只通过 layer-shell default 把新通知 surface 路由到当前焦点 output。
-5. `river-window-management-v1` 按协议规定只发给 WM 一个客户端,bar 拿不到 tags。
-6. river 支持 `ext-foreign-toplevel-list-v1`(0.3.13 起),但只提供 title / app_id,**没有 focus 信息**。
-
-即:**在现代 river 上,tags / 当前窗口标题结构上无法被第三方 bar 获取。** 通知的 output 选择可借助 layer-shell default,但已映射 surface 的实时焦点迁移仍需要 WM 信号;上游 river 实现 `ext-workspace-v1` 或 tailrace 发布状态协议仍不在本项目范围内。
+- river 是非单体合成器:窗口管理由独立 WM 客户端通过 `river-window-management-v1` 实现。
+- river 不向普通客户端暴露 `wlr-layer-shell-unstable-v1`。层壳客户端在 river 上能工作的前提是 WM 实现 `river-layer-shell-v1`。
+- 目标运行时是 river(≥0.4.6)+ tailrace;tailrace 在焦点 output 上设置 layer-shell default。
+- cornice 只使用标准 `wlr-layer-shell`。每张通知 surface 不指定 output,由 river + tailrace 选择当前焦点 output。
+- `river-window-management-v1` 只发给单个 WM 客户端。第三方 bar 结构性无法获得现代 river 的窗口状态,因此不实现任何 `river.*` 模块。
 
 来源:
-- <https://codeberg.org/river/river> (protocol/ 目录、README)
-- <https://github.com/codethare/tailrace> (protocol/、src/)
+
+- <https://codeberg.org/river/river>
+- <https://github.com/codethare/tailrace>
 - <https://codeberg.org/river/wiki/raw/branch/main/pages/useful-software.md>
-- <https://codeberg.org/river/river/issues/1402>
+
+### Apple 参考的边界
+
+Apple 当前说明桌面通知出现在屏幕右上角,Notification Center 负责保留和分组历史通知;macOS 27 更新了 Liquid Glass 的可读性、圆角、材质层次和 spring 动效。Apple 没有公开 macOS 通知横幅的逐像素尺寸,因此本设计只采用可验证的设计原则,不把 Live Activity 尺寸误称为 macOS 通知规范。
+
+来源:
+
+- <https://support.apple.com/guide/mac-help/get-notifications-mchl2fb1258f/mac>
+- <https://support.apple.com/guide/mac-help/notifications-settings-mh40583/mac>
+- <https://developer.apple.com/videos/play/wwdc2026/289/>
+- <https://developer.apple.com/documentation/technologyoverviews/adopting-liquid-glass>
+- <https://developer.apple.com/design/human-interface-guidelines/notifications>
 
 ## 3. 架构
 
-一个进程 `cornice`,一条事件循环,三种职责。
+一个 `cornice` 进程,一条 calloop 主循环,一条独立 D-Bus 线程。
 
 ```
 calloop 主循环
 ├── Wayland fd            (SCTK:registry、layer shell、shm、seat/pointer)
-├── 帧定时器              (仅动画进行中 arm,~60fps)
-├── 子进程 channel        (exec 模块 stdout 行)
-└── 定时器                (clock)
+├── 帧定时器              (仅至少一张通知动画仍在进行时 arm,~60fps)
+├── exec 子进程 channel
+└── 1s 定时器             (clock 与通知到期)
         ▲
-        │ mpsc (calloop::channel)
+        │ calloop::channel
         │
 D-Bus 线程 (zbus blocking, org.freedesktop.Notifications)
 ```
 
-- D-Bus 在独立线程使用 zbus 的 **blocking** API(它自带执行器线程),接口方法把请求结构体通过 `calloop::channel::Sender` 投给主循环。**主循环内没有 async,状态集中在单线程**,动画与通知队列无需加锁。
-- 每个 output 拥有一套栏 surface;通知 surface 单独创建一个,使用 `output = null` 让 river + tailrace 选择焦点 output。
+- 主循环没有 async;通知请求与 exec 输出都通过 `calloop::channel` 进入主线程。
+- 每个 output 一张常驻 bar surface。
+- 每个当前可见或正在退出的通知各有一张 `Overlay` layer surface。surface 独立拥有输入区域、命中矩形和动画状态。
+- 通知 surface 创建时不指定 output,让 river + tailrace 路由到焦点 output;`wl_surface.enter` 记录实际 output,用于输出销毁后的重建。
+- 所有通知 surface 在首个 `configure` 前不得 attach buffer。
+- 静止时只有 1s 定时器;没有通知动画时不 arm 帧源。
 
-### Surface
+### Surface 几何
 
 | surface | layer | anchor | 生命周期 |
 |---|---|---|---|
-| 栏 | `Top` | top + left + right | 常驻,每 output 一个,`exclusive_zone = 栏高 + 2×margin` |
-| 通知 | `Overlay` | top + left + right,`margin_top = bar.margin` | 队列非空时创建一个无显式 output 的 surface,清空后销毁 |
+| bar | `Top` | top + left + right | 常驻,每 output 一个 |
+| 通知 | `Overlay` | left: top + left;center: top;right: top + right | 每条通知一个;入场时创建,退场完成后销毁 |
 
-通知 surface 是全宽透明大块(高度 = 栏高 + 最大卡片区),所有卡片绘制在同一个 buffer 内。每帧调用 `set_input_region` 设为其可见形状的并集,因此透明区域对指针完全穿透。它铺在栏之上(`Overlay` > `Top`),这是拉伸成立的前提:列的 y=0 与栏的 y=0 是同一条线,列与栏重叠的部分不画底色。
+协议规定只给一个轴的锚点时,该轴居中。因此 `position = "center"` 使用 `Anchor::TOP`,不计算虚构的 output 中心坐标。
 
-### 渲染栈
+通知列第一张卡的上边距为:
 
-`smithay-client-toolkit` + `wl_shm` + `cosmic-text`(内部 swash)。纯软件渲染,无 GPU。
+```
+top_margin = bar.margin + bar.height + card_gap
+```
 
-理由:本设计需要的动画是布局插值(位置/尺寸/圆角/颜色),不是特效,软件渲染可逐帧精确控制;横条 1920×32 ≈ 6 万像素、通知卡片 ≈ 5 万像素,60fps 重绘对 CPU 无压力。cosmic-text 提供文本整形与字体回退,保证中文/emoji 不出现乱码 —— 对一个中文用户日常贴顶的横条是硬需求。wl_shm 也是唯一被上游广泛验证的层壳客户端路径。
-
-排除项:`wgpu/glow`(依赖与复杂度翻倍,对扁平风格无收益)、`iced/egui/gtk-layer-shell`(控件风格不可控,与"一致"目标冲突,打包体积大)。
+左/右列的屏幕边距为 `2 × card_gap`;中列由 compositor 居中。通知不占用 exclusive zone。
 
 ## 4. 配置
 
-位置 `$XDG_CONFIG_HOME/cornice/config.toml`,TOML + serde。解析失败时向 stderr 打印含行号的人类可读错误并退出非零 —— 不猜、不静默降级。
+位置 `$XDG_CONFIG_HOME/cornice/config.toml`,TOML + serde。解析失败时向 stderr 打印含 `line:column` 的错误并退出;不猜测、不静默降级。文件缺失不是错误。
 
 ```toml
 [bar]
 height   = 30
-margin   = 0        # 栏到屏幕边缘
-padding  = 8        # 栏内左右留白
-spacing  = 6        # 模块之间
+margin   = 0
+padding  = 8
+spacing  = 6
 
 [theme]
 background = "#1a1a1aee"
 foreground = "#dcdcdc"
 accent     = "#88c0d0"
 font       = "Inter 11"
-radius     = 15     # 缺省 = height/2,即胶囊形
+radius     = 15
 
 [bar.left]
 modules = [ { kind = "clock", format = "%H:%M" } ]
@@ -117,37 +113,25 @@ modules = []
 [bar.right]
 modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
-  { kind = "exec", command = "while true; do awk '{print int($1/1024)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
-  { kind = "notification" },   # 通知卡片画在这里(只能配一个)
 ]
 
 [notification]
-max_visible = 4     # 队列的可见窗口(超出的保留、不绘制);屏幕上只画首卡 + 一条窥视条
-enter_ms    = 220   # 拉伸(栏 → 整列)
-exit_ms     = 160   # 收回(整列 → 栏)
+position     = "right" # left | center | right
+max_visible  = 4
+enter_ms     = 220
+exit_ms      = 160
 ```
 
-三块各自是一个**有序模块列表**,这就是"自由搭配"的全部含义:没有嵌套容器,没有布局语言。换顺序即换顺序,关掉即删掉。
+`[notification]` 是通知系统的开关:
 
-**比例派生**:`radius`、卡片间距、卡片内边距、卡片宽与卡片圆角缺省都由 `height` 派生,需要时再显式覆盖。默认值下,一屏配置只需写三个模块列表 —— 这是"一致"的来源。
+- 整个 section 缺失时,D-Bus 守护进程仍运行并处理/到期通知,但不创建通知 surface。
+- section 存在时,`position` 默认 `right`,与 macOS 桌面通知习惯一致。
+- `position` 只接受 `left`、`center`、`right`;其他值在解析层报错并带位置。
+- 旧的 `{ kind = "notification" }` bar 模块被删除,不再兼容;它会作为未知 module kind 报错。
 
-**Apple 参考的三个尺寸**(HIG Live Activities 的 iOS 规格):展开态灵动岛是 **371×84–160 pt、圆角 44 pt**,而紧凑态岛高 **36.67 pt** —— 也就是说卡片宽 ≈ 10× 栏高、圆角 ≈ 1.2× 栏高,且宽高是**固定尺寸**而不是内容撑开的。corresponding:`card_w = clamp(10 × height, 80, 420)`、`card_radius = 1.2 × height`。
+bar 的三个 module 列表只包含 `clock` 与 `exec`。通知卡片是否存在、位于哪里,完全由 `[notification]` 决定。
 
-### 模块种类(v1)
-
-| kind | 数据来源 | 参数 |
-|---|---|---|
-| `clock` | 本地时间 | `format`(chrono 格式串) |
-| `exec` | 长驻子进程 stdout,一行一次更新;进程退出后 1s 重启 | `command`、`format`(含 `{out}`) |
-| `notification` | 进程内的通知守护进程队列 | 无(行为由 `[notification]` 配置) |
-
-`notification` 不产出文字:它只标记"通知卡片挂在这里",并在栏里占据当前最宽卡片的宽度,所以相邻模块不会被卡片压住。它只能出现在三个区域中的一个,**只能配一次** —— 一块材质只能从一个地方拉出来。未配置它时通知不绘制(D-Bus 守护进程照常运行)。
-
-除这三种之外的就是刻意的:现代 river 上第三方 bar 拿不到 WM 状态(§2),系统信息(CPU/内存/电量)本来就该由脚本产出,这也正是最初需求里说的"支持由外部的脚本来显示 CPU/mem/battery"。
-
-`exec` 采用长驻流式(而非定时轮询):轮询类需求由脚本自己写循环表达(`while true; do …; sleep 5; done`),bar 端因此不需要 interval 机制与进程 spawn 调度。
-
-## 5. 模块契约
+## 5. bar 契约
 
 ```rust
 struct Span {
@@ -158,159 +142,155 @@ struct Span {
 }
 
 trait Module {
-    fn update(&mut self, ev: &Event) -> bool; // 返回是否需要重绘
+    fn update(&mut self, ev: &Event) -> bool;
     fn spans(&self) -> Vec<Span>;
 }
 ```
 
-`Span` 是唯一的 widget 原语,同时覆盖:多段异色文本、通知按钮、模块文字。栏渲染即把各模块的 spans 展平、排版、记录命中矩形。v1 只把 `action` 接到通知按钮上 —— 原语保留,依赖不引。
+- left 靠左排,right 靠右排,center 以屏幕中线居中。
+- 三者重叠时 center 优先,两侧模块按可用宽度截断。
+- 模块之间使用 `bar.spacing`;没有通知模块,因此通知出现和消失不会改变 bar 内任何模块的位置。
+- 文本按 cap height 定位,字体度量由首帧光学校正并缓存。
 
-### 布局算法
-
-- left 靠左排,right 靠右排,center 以**屏幕中线**居中(不是以剩余空间居中)。
-- 三者重叠时 center 优先,两侧模块按需省略号截断。
-- 宽 0 的模块(队列为空的通知模块)既不占宽也不占模块间距,所以它的存在不影响栏的样子。
-- 规则写进文档,保证可预测:不会因为文字变长而抖动。
-
-### 光学校正(2026-09-22 修正,2026-09-23 按 Apple 参考重定)
-
-两处“数学对、眼睛不对”的地方,按排版研究的做法显式计算,而不是留一个手调的数字:
-
-- **连续圆角(不是圆弧)**:所有圆角都是超椭圆 `|x|ⁿ + |y|ⁿ = rⁿ`,n = 4(Apple 的 `UICornerCurve.continuous` 默认曲线)。圆弧在直线处只是相切,曲率突跳,所以看上去像“切了角的方框”;超椭圆在直线处曲率为 0,整个形状读作一个整体。n = 4 对应 Figma 的 “corner smoothing 0.6 ≈ iOS 形状”。这是形状语言的常量,不是旋钮(`geom::CORNER_EXPONENT`)。
-- **胶囊两端的内容内缩**:`bar.padding` 之外再加圆角的 45° keyline 距离。连续圆角比圆弧“胖”,所以值是 `r - r/2^(1/n)` ≈ 0.16 r(半径 15 时为 2px;圆弧则为 0.29 r ≈ 4px)。此值与 radius 绑定,不可配置。
-- **文本按 cap height 定位**:行盒包含 cap 之上的行距和 baseline 之下的降部空间,而 `09:19` 这类字符串一个像素都用不到,所以“把行盒居中/按行盒加内边距”会差 `(line_height - cap)/2`。UI 里每一行文字都按 cap 居中(`TextEngine::optical_top`):栏内文字在自己的行里,通知的首卡与窥视条和栏共用同一条线,正文行从那条线按行距往下排。字体度量由首帧光栅化一个 `H` 量出并缓存(`TextEngine::cap_metrics`)。
-- **标题用主色、正文用次色**:Apple 的通知标题是主标签、正文是次标签(`secondary`= foreground × 0.72)。**没用 semibold**:请求的字重会落到配置家族之外(实测 `monospace` 下 `"Card 6"` 从 33.4px 变成 53.6px),反而拆掉了等宽网格，所以层次靠颜色而不是字重。
-
-### 通知信息层级(按 Apple HIG 重定)
-
-[Notifications](https://developer.apple.com/design/human-interface-guidelines/notifications) 要求通知能在余光中识别来源与标题,内容简洁,操作只保留能直接完成任务的按钮。cornice 不支持应用图标,因此不伪造图标:`app_name` 放在标题行最右侧,以 `secondary` 显示并最多占卡片内容宽的 1/3;summary 留在左侧、以主标签色显示,始终比来源更醒目。空 `app_name` 不占位。`app_name` 是客户端自报文本,只作来源提示,不当作可信身份。
-
-- **操作按钮**:低透明度 accent 胶囊底 + accent 文字,不再用整块实色 accent;文字按 cap height 在按钮内居中。只绘制卡片内还能完整容纳的按钮,绘制矩形就是命中矩形。
-- **单行字段**:summary、`app_name`、action label 都只取第一行,再按剩余宽度截断;正文仍按既有 5 行 / 300 字符上限处理。它们都是 D-Bus 信任边界,不能让换行偷出行盒或按钮。
-- **内容节奏**:标题下出现正文或操作时,detail block 先从栏底边之外开始,留 `card_gap / 2`,再画一条厚度为 `max(card_gap / 3, 1)` 的低透明度 `secondary` 分隔线;分隔线后才是正文或按钮。短通知仍完全贴在栏内,不凭空增加分隔物。这是 Apple Live Activities 对“用 inset 容器或线分隔内容块”的直接落地。
-- **折叠预览**:窥视条除下一条 summary 外,最右侧用 accent 显示 `×N`,明确它代表多少条通知;`N` 包含队列中尚未进入 `max_visible` 的条目,summary 与计数都按剩余宽度截断。
-
-参考:[Notifications](https://developer.apple.com/design/human-interface-guidelines/notifications)、[Live Activities](https://developer.apple.com/design/human-interface-guidelines/live-activities)。规格决定信息层级,不要求复制 Apple 品牌资产或像素外观。
-
-## 6. 通知子系统
+## 6. 通知语义
 
 ### D-Bus 接口
 
-- `GetCapabilities` → `["body", "actions", "persistence"]`。不声明 `body-markup` / `icon-static` / `sound`,客户端(含 `notify-send`)会自动退化为纯文本。
+- `GetCapabilities` → `["body", "actions", "persistence"]`。
 - `Notify(app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout) -> id`
 - `CloseNotification(id)`
 - `GetServerInformation` → name `cornice`,spec 1.2
 - 信号:`NotificationClosed(id, reason)`、`ActionInvoked(id, action_key)`
 
-### 语义
+### 队列
 
-- **hints**:只认 `urgency`(0/1/2,决定配色与缺省时长);其余忽略且不报错。
-- **时长**:`expire_timeout = -1` 用缺省(low 4s / normal 6s / critical 不自动消失);`0` 永不自动消失但仍可点击关闭;`>0` 照用。
-- **`replaces_id`**:命中已有条目则就地替换内容与来源(不重放形变),否则新建。
-- **来源与截断**:`app_name` 用作标题行尾部的次级来源标签;summary、来源与 action label 都只取第一行并按卡片宽度截断。正文超长按行数与字符数截断并加省略号。这是信任边界,必须做。
-- **队列**:按新→旧排序,`max_visible` 之外的不绘制但保留,前方消失后依次滑入;溢出丢弃最旧。
-- **关闭原因**:1 = 超时,2 = 用户关闭,3 = `CloseNotification`。
+- 可见顺序为新 → 旧;`max_visible` 之外保留但不绘制。
+- 容量为 `max_visible × 4`;溢出时静默丢弃最旧条目。
+- `replaces_id` 命中时就地替换,不重放入场动画。
+- `expire_timeout = -1` 使用 low 4s / normal 6s / critical 不自动消失;`0` 永不自动消失;`>0` 照用。
+- 关闭原因:1 = timeout,2 = 用户,3 = `CloseNotification`。
+- D-Bus 不可用时 bar 继续运行,仅通知功能不可用。
 
-**放置**:卡片画在 `notification` 模块所在的位置。该模块在栏布局里占一个槽位,宽度 = 当前可见卡片中最宽的一张(content 派生,`MIN_CARD_W=80` .. `MAX_CARD_W=420`);队列为空时宽 0。模块只能配一个,未配置则不绘制卡片。
+### 不可信内容
 
-### 输入
+- `app_name`、summary、action label 只取第一行并按卡片内容宽裁剪。
+- body 最多 5 行 / 300 字符,每个 body 行按内容宽裁剪。
+- 多行 body 和 actions 参与卡片高度计算。
+- action 命中矩形不得越过卡片 inner edge;只绘制能够完整容纳的 action。
+- 点击卡片主体或中键关闭;左键 action 先于卡片主体命中。
 
-左键点卡片 = 关闭;中键 = 关闭(mako 惯例);左键点低透明度 accent 按钮 = `ActionInvoked` + 关闭。栏内那一行文字也是卡片的一部分,点它也关闭卡片。命中判定与 `set_input_region` 共用同一份绘制期产出的矩形表,避免两处不一致。
+## 7. 独立卡片布局与材质
 
-### 降级
+### 比例
 
-若 `org.freedesktop.Notifications` 已被其他守护进程占用,栏照常运行,打印警告,仅通知功能不可用 —— 不退出。
+通知的所有固定尺寸都从 `theme.height` 派生:
 
-## 7. 拉伸(stretch)
-
-通知卡片由 overlay surface 绘制(栏 surface 只有 `height` 高,画不出栏下方),但它画的是**栏自身的材质**:列矩形从 y=0(栏顶)开始,与栏重叠的部分**不画底色** —— `theme.background` 是半透明的(`#1a1a1aee`),同一块地方画两遍会把重叠区压暗,那就正好看起来像贴在栏下面而不是从栏里拉出来。只有栏底边以下填色,底角圆角,顶边被栏底边切齐:没有缝,也没有凹口。
-
-单条 tween,插值对象只有 h 与文字 alpha(y 恒为 0,x/w 跟随当前布局,不插值)。运动是 **spring,不是缓动曲线**(Apple 的 `spring(response:dampingFraction:)`,WWDC23《Animate with springs》建议所有状态变化都用 spring):开场 ζ=0.7、约 4% 过冲,收回 ζ=1(临界阻尼,不过冲)。ω 取 8,使 spring 的自然周期落在配置的时长窗口内 —— 否则 `enter_ms` 就成了摆设(Apple 的 `response` 是周期,不是稳定时间)。
-
-```
-t=0   rect = (槽位 x/w, y = 0, h = 栏高)   → 与栏自身像素完全重合,视觉上什么都没拉出来
-t=1   rect = 整叠(顶到栏顶,底到窥视条的底边)
-```
-
-- **向下拉伸,不是飞进来**:y 全程为 0,x/w 跟随当前布局(栏内模块宽度变化时卡片跟着走),只有 h 由栏高长到整叠高。每一帧形状都挂在栏的底边上,所以看起来是栏被拉长。
-- **已经在开着就不再重放**:开着的岛来了新通知是"接着长"(`AnimKind::Enter { fade }`),tween 从当前形状起算、不淡入;只有从关闭状态开场才淡入(`alpha = clamp((t - 0.35) / 0.65)`)。文字不位移,所以只淡入。
-- 退场是同一 tween 的反向,160ms:形状向上收回栏内。退场不画已关闭卡片的残影 —— 行随队列立即上移,形状随后收回。**只有关掉首卡才会真的收回**:关掉窥视条(或更后面没画出来的条目)时形状原地不动,只换内容,不播动画。
-- 两者缺省值可在 `[notification]` 覆盖。
-- 动画期间栏 surface 完全不重绘,只有 overlay surface 在动。
-- 静止时不 arm 帧定时器,零唤醒。
-
-**挂接点**:叠的水平范围必须落在栏底边的直线段内,即 `[radius, output_w - radius]`;模块槽位超出这个范围时按此裁切。栏两端是圆角,那里没有直线底边,方角顶面挂在那里会留下一个凹口 —— 那正是“背景与栏分离”。
-
-**关键耦合**:叠的 x/w 来自 `BarLayout` 里 `notification` 模块所占的槽位矩形。卡片宽度是**固定值** `card_w = clamp(10 × height, 80, 420)`(见 §5 的 Apple 比例),不随内容变化,所以首卡与窥视条等宽,而且栏的预留宽度在通知存续期间不再变。队列为空时宽 0,且**0 宽模块不占模块间距**,所以没有卡片时栏的其余模块不会移位。栏的布局结果就是通知模块的输入 —— 同一份数据,不重算。
-
-**首卡在栏里**:首卡(最新)的来源、summary 与栏内其他模块**共用同一条文字线**(cap height 居中,不额外加卡片内边距);来源靠右且为次色,summary 靠左且为主色。只有放不下的行才向下拉伸;正文或操作块与标题之间先出现派生间距和低对比度分隔线。因此一条短通知整个都在栏里,栏下方什么都不画。
-
-**卡片堆叠**:首卡之后**不再是一张一张的卡,而是一条折叠的窥视条**(macOS 的折叠栈):高度正好是栏高、圆角是 `radius`(即栏自己的紧凑形态),`card_gap` 挂在首卡下方。左侧画下一条通知的 summary(`secondary` 色),右侧用 accent 画 `×N`;两者按剩余宽度截断,不做正文与按钮。点它关掉那条通知,与其他卡一致。更后面的条目仍留在队列里,前面的消失后依次升上来。
-
-**退化情况**:未配置 `notification` 模块时不绘制卡片(守护进程照常运行);队列为空时不创建 overlay surface。
-
-**为什么折叠(2026-09-24,按 16:9 重审)**:通知栈的高度是**屏幕空间的预算**,不是栏材质的比例。24 英寸 1920×1080 在 60cm 观看距离下,水平全角 47.7° 而垂直只有 28.0° —— 竖轴才是稀缺的那一轴。四张满卡时最下面一张的垂直偏心约 −4°,正好落在屏幕竖直中线上,也就是用户的焦点区里;而且越晚到的通知越侵入,与“最新的一条最要紧”正好相反。折叠把栏下方的开销从约 685px 压到约 137px,并且不再随 `max_visible` 增长。
-
-**surface 高度**:`max_tail` = 最坏的首卡 + `card_gap` + 一条窥视条,再**封顶在 output 高度的 1/4**(`view::MAX_TAIL_PERCENT`)。`bar.height` 是 1..=256 的配置项,在矮屏上必须由屏幕而不是栏来决定叠能借多少;封顶之后超出的部分被 surface 裁掉。output 高度取 `zxdg_output_v1` 的 logical size,退化时取当前 mode。surface 只创建一次、尺寸不变 —— 逐帧 resize 要过一趟 configure,动画会抖。
-
-**多显示器**:通知 surface 创建时不指定 output,由 river + tailrace 将它解析到当前焦点 output;`wl_surface.enter` 记录实际 output,再按该 output 的逻辑高度请求 surface size,并使用对应栏的槽位。默认 output 只在 surface 创建时选择,已经映射的 surface 不会因之后焦点变化而自动迁移;若需要实时迁移,必须由 WM 暴露焦点变化信号。
-
-## 8. 文件划分
-
-```
-Cargo.toml
-src/main.rs                       装配:config → wayland → surfaces → channels
-src/geom.rs                       Rect、Color
-src/config.rs                     serde schema、默认值派生、校验与错误文案
-src/theme.rs                      配色 + 由 height 派生的比例
-src/widget.rs                     Span / Action / Module / Event
-src/canvas.rs                     圆角矩形、裁剪、alpha 混合
-src/text.rs                       cosmic-text 排版与光栅化、省略号截断
-src/anim.rs                       easing + Tween
-src/wayland/mod.rs                连接、registry、layer surface、shm 缓冲池、seat
-src/bar/mod.rs                    栏 surface、左中右布局、BarLayout 快照
-src/bar/modules.rs                clock / exec
-src/notify/queue.rs               通知队列状态机(纯逻辑)
-src/notify/service.rs             zbus 线程 + D-Bus 方法
-src/notify/view.rs                列几何 + 拉伸 tween + 命中
-docs/smoke.md                     手动验证清单
+```text
+card_gap     = max(height / 5, 2)
+card_padding = max(height / 2, 4)
+card_w       = clamp(10 × height, 80, 420)
+card_radius  = 1.2 × height
+card_min_h   = max(2.5 × height, text line + 2 × card_padding)
 ```
 
-比 v1 spec 多出 `geom.rs` / `widget.rs` / `notify/queue.rs`(bar 与 notify 共用的原语,以及可单测的状态机),少掉 `build.rs` 与 `protocols/`(不再需要任何自定义协议)。
+- 宽度固定,同一列中的卡片等宽;高度按内容增长,最低为 `card_min_h`。
+- 内容在卡片内垂直居中;标题与来源组成第一行,正文/actions 作为 detail block。
+- detail block 与标题间使用 `card_gap / 2` 和 `max(card_gap / 3, 1)` 的低对比度分隔线。
+- 卡片背景使用 `theme.background` 的半透明色,所有圆角使用 `geom::CORNER_EXPONENT = 4` 的连续曲线。
+- 卡片与 bar 没有重叠,因此不画“接在 bar 底边下面”的特例,也不画第二层背景。
+- 不画 GPU 模糊或阴影;透明叠加和内容层级承担 macOS 27 的轻盈感。
 
-## 9. 测试
+### 列布局
 
-全部为可运行的纯逻辑测试,不引入测试框架:
+`visible` 中每条通知都生成一个 `Card`:
 
-- **配置**:解析、缺省值派生(如 `radius = height/2`)、错误信息含行号
-- **几何**:`Rect::contains` / `union`(输入区并集)、`Canvas` 越界不 panic
-- **canvas**:圆角矩形四角不被填充、中心被填充、alpha 混合结果
-- **文字**:按宽度截断加省略号(注入假测量函数)
-- **exec**:`{out}` 模板替换、子进程退出后重启
-- **tween**:t=0 等于起点、t=1 等于终点、进度单调、超出范围被 clamp
-- **通知状态机**:时长缺省表(-1 / 0 / urgency)、`replaces_id` 就地替换内容与来源、`max_visible` 溢出、关闭原因 1/2/3、超长截断
-- **命中**:按钮矩形 ↔ action 映射;超长 action label 的矩形始终留在卡片内
-- **内容节奏**:标题与正文/操作之间的派生间距、分隔线位置,以及仅有操作时的独立行布局
+```text
+card[0].top = 0
+card[i+1].top = card[i].top + card[i].height + card_gap
+```
 
-协议层不做自动化测试(需要真实 compositor),改为 `docs/smoke.md` 中的手动清单。
+`position` 只改变每张 layer surface 的水平 anchor,不会改变内容布局。三种位置都必须让整张卡和其命中区域保持在对应一侧。
 
-## 10. 里程碑
+## 8. 动画
 
-每个里程碑都能单独跑起来:
+通知动画状态按通知 id 保存;不同通知可以同时播放,但整个进程仍只有一个 1s 定时器和一个 frame source。
 
-1. Wayland 连接 + layer-shell 栏 surface + shm + 纯色背景(端到端探针)
-2. 配置 schema + 主题派生 + 校验
-3. Canvas + 文字排版
-4. 栏左中右布局 + `clock` 模块
-5. `exec` 模块(子进程、行协议、重启)
-6. `anim`(easing / Tween)
-7. 通知服务:D-Bus + 队列状态机
-8. 通知视图:静态卡片 + 输入命中
-9. 拉伸 tween 接线 + `max_visible` + `docs/smoke.md`
+- 入场:新卡从 `scale = 0.94`,`alpha = 0` 到 `scale = 1`,`alpha = 1`;使用 `Easing::Spring`,配置 `enter_ms`。
+- 退场:卡从当前形状到 `scale = 0.96`,`alpha = 0`;使用 `Easing::Smooth`,不超调,配置 `exit_ms`。
+- 旧卡重新排布:每张仍存活的卡从旧 `top` spring 到新 `top`;新卡出现和旧卡关闭都会触发。
+- 文本随卡片一起淡入淡出;不对每行文字单独做位移动画,避免内容抖动。
+- 退场中的卡不响应点击,输入区域立即清空。
+- 任一路径开始或延长动画都必须调用 `ensure_frame_source()`;动画完成后清除 `animating`,frame source 用 `TimeoutAction::Drop` 自毁。
+- `replaces_id` 只更新内容并重新计算必要的高度/位置,不重放入场。
 
-## 11. 风险
+动画的纯逻辑(位置/比例/alpha/完成判断)放在 `notify::view`;Wayland 只拥有 surface、buffer、timer 和协议回调。
 
-- **开发沙箱内没有可用的 river 会话。** 构建环境只能保证编译通过 + 纯逻辑测试通过;实际画面、层壳行为、动画手感必须在使用者的 river + tailrace 会话中验证。不得声称已验证未验证的内容。
-- 沙箱内 `XDG_RUNTIME_DIR` 缺失,任何需要真实 session bus / wayland socket 的步骤都无法在此运行。
-- **`river-layer-shell-v1` 由 WM 转发**,与 wlroots 原版可能存在细节差异,尤其涉及运行时改尺寸、`set_input_region`、overlay layer 的堆叠。因此里程碑 1 即最小端到端探针,让风险最先暴露。
-- 若 tailrace 未绑定 `river_layer_shell_v1`(旧版本,或配置异常),cornice 会在启动时报 "layer shell is not available" 并退出 —— 这是预期行为,不是 bug。
+## 9. 输入与生命周期
+
+- 绘制和 `set_input_region` 使用同一份每卡命中矩形;`set_input_region` 永远传 `Some`,透明或退场状态传空 region。
+- 一个通知的 action 矩形先于该通知的主体矩形;不同 surface 之间由 Wayland surface 命中路由。
+- 点击 action 发出 `ActionInvoked` 后关闭;点击主体发出 `NotificationClosed(..., 2)`。
+- 队列移除后,退场通知暂时保留自己的 `Notification` 副本和 surface,直到 exit tween 完成;其他卡同时向新的列位置补位。
+- compositor 关闭通知 surface 时不退出进程;清掉该 surface 后按当前队列重建。
+- 输出销毁时,落在该输出的通知 surface 被销毁并在新的默认 output 上重建。
+
+## 10. 文件职责
+
+| 文件 | 责任 |
+|---|---|
+| `geom.rs` | `Rect` / `Color`;alpha 透传,只在 `to_shm_bytes` 预乘 |
+| `canvas.rs` | `wl_shm` 写入、裁剪、连续圆角;不知道文字 |
+| `text.rs` | cosmic-text、宽度裁剪;不知道布局 |
+| `widget.rs` | `Span` / `Action` / `Event` / `Module` |
+| `theme.rs` | 颜色与由 height 派生的比例 |
+| `config.rs` | TOML schema、`[notification].position`、解析与行号错误 |
+| `anim.rs` | `Easing` / `Tween`;不持有协议或布局 |
+| `bar/mod.rs` | 左/中/右布局;不绘制通知 |
+| `bar/modules.rs` | `clock` / `exec` |
+| `notify/queue.rs` | 通知状态机;不碰 D-Bus 或渲染 |
+| `notify/service.rs` | zbus 接口和信号 |
+| `notify/view.rs` | 独立卡片尺寸、列位置、动画插值、绘制和命中 |
+| `wayland/mod.rs` | 唯一持有 `State` 和 Wayland 回调;每卡 surface 生命周期与 timer |
+
+## 11. 测试与手动验证
+
+### 纯逻辑 `cargo test`
+
+必须覆盖:
+
+- `[notification]` 缺失时关闭,三种 position 解析,非法 position 的行号
+- bar module 只接受 `clock` / `exec`,通知出现不改变 bar 布局
+- 多条通知全部生成独立卡片,顺序、间距、宽度和最小高度
+- 三种锚点的 top margin 与 side margin
+- 不可信字段/body/action 裁剪,action 命中矩形不越界
+- 入场/退场端点、alpha/scale 单调性、完成判断、逐卡独立性
+- 队列替换、可见窗口、容量、超时、关闭原因
+- `Rect` / canvas / 文本既有纯逻辑回归
+
+协议和像素层不做自动化断言,按 `docs/smoke.md` 手动检查。
+
+### Smoke 重点
+
+- bar 中没有通知槽位;第一条通知出现时 bar 文本不移动。
+- 单条通知是一张完整独立卡,不是 bar 的延伸;短通知也不与 bar 拼接。
+- 多条通知新 → 旧纵向排列,每张有独立背景、圆角、间距和点击区域。
+- `left` / `center` / `right` 三种位置整列对齐正确,透明区域点击穿透。
+- 入场和退场 spring 可见且不造成文本跳闪;关闭一条后其余卡平滑补位。
+- 退场/透明区域不吞点击;action 优先于主体关闭。
+- 首个 configure 前没有 buffer,没有 `wl_surface` 协议错误。
+- river + tailrace 下每张通知路由到焦点 output,输出移除后能重建。
+
+## 12. 风险
+
+- 开发环境没有可用的 river 会话,只能保证纯逻辑测试和构建;动画手感与真实 layer-shell 行为必须在目标环境 smoke。
+- `Anchor::TOP` 的水平居中由 layer-shell 协议定义,但 river 的 WM 转发实现仍需手动确认。
+- 纯软件逐卡 surface 会增加 Wayland surface 数量,上限由 `max_visible` 和队列容量约束;不做 GPU 模糊。
+- 内容高度依赖 cosmic-text 字体度量,配置字体变化会改变卡片高度;smoke 需覆盖 fallback 字体。
+
+## 13. 实施顺序
+
+1. 配置 schema 与 bar 模块删除,先让旧 bar 编译并通过纯逻辑测试。
+2. `notify::view` 独立卡片布局和逐卡动画纯逻辑。
+3. Wayland 每卡 surface、anchor、输入与 timer 接线。
+4. 更新模板、smoke 和本设计约束。
+5. `cargo fmt --check`,`cargo test`,`cargo build`。

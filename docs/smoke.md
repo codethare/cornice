@@ -1,24 +1,37 @@
 # Smoke check
 
-Each section states what it **can prove** and what it **cannot prove**. The first three sections run in the dev sandbox; section 4 can only be done by the user in the target environment.
+The automated gate is pure logic only. Protocol and pixel behaviour must be checked manually in the target environment.
 
-## 1. Pure logic (`cargo test`)
+## 1. Pure logic
 
 ```sh
 cargo test
 ```
 
-Covers: geometry (`Rect`/`Color`), canvas (rounded corners / blending / out of bounds), text truncation, config parsing (errors carry line numbers), bar layout (including the notification module's reserved width), the `clock`/`exec` modules, easing and tweening, the notification queue state machine (including replacement of its source label), and the notification column — first-line sanitising for untrusted headline fields, the collapsed count, action hit rects bounded by the card, the derived headline/detail separator, action-only layout, the head card plus peek geometry, the stretch, the output-height cap on the surface, and that the head paints no background inside the bar.
+Covers:
+
+- geometry, continuous canvas corners, alpha blending and text clipping;
+- bar layout without a notification slot;
+- `[notification]` optional enablement, `left | center | right`, and line-numbered config errors;
+- independent card widths, content heights, vertical order/gaps, detail rhythm and untrusted action bounds;
+- per-card enter/exit/reflow motion endpoints and independence;
+- queue replacement, visibility, capacity, timeout and close semantics;
+- D-Bus-independent notification state transitions.
 
 - **Proves**: pure logic has no regressions.
-- **Does not prove**: any pixels, any protocol behaviour.
+- **Does not prove**: layer-shell placement, pixels, pointer input or animation feel.
 
-## 2. D-Bus (runs inside the sandbox)
+## 2. D-Bus in the sandbox
 
 ```sh
-export XDG_RUNTIME_DIR=/tmp/cornice-xdg; rm -rf $XDG_RUNTIME_DIR; mkdir -p $XDG_RUNTIME_DIR; chmod 700 $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR=/tmp/cornice-xdg
+rm -rf "$XDG_RUNTIME_DIR"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
 WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null >/tmp/sway.log 2>&1 &
 sleep 3
+
 dbus-run-session -- sh -c '
   WAYLAND_DISPLAY=wayland-1 ./target/debug/cornice >/tmp/cornice.log 2>&1 &
   sleep 1
@@ -29,91 +42,61 @@ dbus-run-session -- sh -c '
     --object-path /org/freedesktop/Notifications \
     --method org.freedesktop.Notifications.Notify \
     test 0 "" "title" "body" "[]" "{}" -1
-  notify-send "hi" "body"
+  sleep 1
   kill %1
 '
 ```
 
-- **Proves**: the `org.freedesktop.Notifications` name is owned, the `GetCapabilities`/`Notify` contract, that `notify-send` works, and signals (capture them with `dbus-monitor`).
-- **Does not prove**: that notifications have any pixels, that cards animate, or that clicks work.
+- **Proves**: the daemon owns `org.freedesktop.Notifications`, accepts `notify-send`-compatible requests and does not crash while creating card surfaces.
+- **Does not prove**: correct position, pixels, independent animations or clicks.
 
-## 3. headless sway (runs inside the sandbox, **but is not the target environment**)
+## 3. Headless sway startup
 
 ```sh
-export XDG_RUNTIME_DIR=/tmp/cornice-xdg; rm -rf $XDG_RUNTIME_DIR; mkdir -p $XDG_RUNTIME_DIR; chmod 700 $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR=/tmp/cornice-xdg
+rm -rf "$XDG_RUNTIME_DIR"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
 WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null >/tmp/sway.log 2>&1 &
 sleep 3
-WAYLAND_DISPLAY=wayland-1 timeout 5 ./target/debug/cornice; echo "exit=$?"
+WAYLAND_DISPLAY=wayland-1 timeout 5 ./target/debug/cornice
 ```
 
-- **Proves**: cornice attaches to layer-shell, `bar configured: 1280x30`, and the notification surface maps without panicking under a real notification sequence.
-- **Does not prove**: **sway uses wlroots' native layer-shell; river goes through the WM-forwarded `river-layer-shell-v1`, so behaviour is not guaranteed to match.** The sandbox has no screenshot tool, so "renders correctly" and "the animation feels right" cannot be verified here — only "it starts, the surface maps, it does not panic".
+Expected: the bar configures as `1280x30`; sending notifications produces one `notif <id> configured: WxH` line per visible card and no protocol error before the timeout.
 
-## 4. river + tailrace (`scripts/live/run.sh`)
+- **Proves**: attachment to wlroots layer-shell, first-configure ordering and basic per-card surface mapping.
+- **Does not prove**: target river behaviour or visual correctness.
 
-The target stack, headless: real `river`, real `tailrace` as the WM, real `cornice` — one shell script, nothing
-mocked. It starts `WLR_BACKENDS=headless` river with tailrace (the compositor and the WM are read-only inputs,
-never modified), runs cornice under a private session bus, and then checks pixels and input:
+## 4. Manual river + tailrace pass
 
-* **pixels** from `grim` (river's `wlr-screencopy`), analysed by `scripts/live/shot.py` (stdlib Python, no PIL)
-* **a window** from `scripts/live/probe.c win` — a coloured `xdg_toplevel` that logs pointer events — to prove the
-  exclusive zone and click-through
-* **a pointer** from `scripts/live/probe.c vp` — `zwlr_virtual_pointer_v1` (river advertises it), `at X Y` warps and
-  clicks like a real mouse
-* **notifications** from `gdbus` on the private bus, with `dbus-monitor` capturing `NotificationClosed`/`ActionInvoked`
+Use a real river + tailrace session and the target output. Set a longer duration when inspecting motion:
 
-```sh
-cargo build && (cd ../tailrace && cargo build --release)
-bash scripts/live/run.sh          # 52 checks, exit code = failures
-python3 scripts/live/artifacts.py # rebuild testing/*.png from the run's screenshots
+```toml
+[notification]
+position = "right" # repeat with left and center
+max_visible = 4
+enter_ms = 600
+exit_ms = 400
 ```
 
-Environment overrides: `RIVER_BIN`, `TAILRACE_BIN`, `CORNICE_BIN`, `W` (scratch dir, default `/tmp/cornice-live`);
-logs, screenshots and the test config stay under `W`. Needs `grim`, `gcc`, `wayland-scanner`, `dbus-run-session`,
-`gdbus`. It kills only the PIDs it started (a `pkill river` would kill a real session).
+- [ ] The bar contains only its configured `clock` / `exec` modules; there is no reserved notification gap.
+- [ ] The first card starts below `bar.margin + bar.height + card_gap`; it neither overlaps nor shares material with the bar.
+- [ ] A one-line card has the derived minimum height; body/actions grow the same card without changing its fixed width.
+- [ ] All corners read as continuous/squircle curves. The translucent material does not show a doubled overlap, black seam or square notch.
+- [ ] `left`, `center`, and `right` anchor the whole vertical column correctly. Side cards keep `2 × card_gap` from the screen edge; the centre card is truly centred.
+- [ ] Three simultaneous notifications produce three independent cards in new → old order with one `card_gap` between them. No card is collapsed into a peek pill.
+- [ ] Each card enters with its own scale/fade spring; older cards spring to new vertical positions. Replacing an id updates in place without replaying enter.
+- [ ] Closing one card fades/scales it out while the remaining cards spring upward. The exiting card cannot be clicked.
+- [ ] Left-clicking an action emits `ActionInvoked` before closing; clicking elsewhere on that card emits `NotificationClosed(..., 2)`. Middle-click also closes the card body.
+- [ ] Transparent pixels inside and around each surface pass clicks through to the window below; removing `[notification]` creates no card surface while the D-Bus daemon still runs.
+- [ ] No buffer is attached before the first configure; the compositor log has no protocol error.
+- [ ] Sending more than `max_visible` keeps the excess queued. Closing a visible card promotes the next notification with an enter animation.
+- [ ] With a second output focused, each newly created card appears on that output. Removing the output rebuilds live cards on the remaining/default output.
+- [ ] Idle CPU does not show sustained 60 fps wakeups after all enter/exit/reflow motion has completed.
 
-Checks: bar band and height, left/center/right placement and the optical inset at the bar's rounded ends,
-a window lands exactly at `bar height + vertical_gap` (exclusive zone reached the WM), that a short card is drawn
-*inside* the bar while a long body stretches below it (one unbroken piece from the bar's row down, attaching where
-the pill's bottom edge is straight), that a second notification collapses into one peek pill one `card_gap` below
-at the same width, carrying that notification's summary (macOS collapsing stack) and that a third does not lengthen
-the stack further, `expire_timeout` / critical / `CloseNotification`, expiry emits `NotificationClosed`
-reason 1, a replace stays put while a new id is still stretching (the spring is measured), that the drawn stack stays
-at the head card plus one pill however deep the queue is, card click → reason 2, action button → `ActionInvoked`,
-click-through on a transparent region, idle CPU, config
-errors with line numbers, and the two-output behaviour.
+## Known environment limits
 
-- **Proves**: the whole checklist below except the two items marked *(human)* — on river + tailrace, with pixels and pointer input.
-- **Does not prove**: that the animation *feels* right (the harness measures rects, it cannot judge easing), anything
-  about real hardware (libinput devices, GPU, multi-monitor geometry), and the multi-output check only asserts
-  "exactly one output" (see the compromise below).
-
-### Manual pass on the real machine
-
-- [ ] *(human)* The stretch reads as the bar's own material pulling downwards — to watch it slowly, set
-      `[notification] enter_ms = 60000` and take a screenshot every second: the shape's top edge stays at the bar's
-      top while its bottom edge walks down, and at no frame is there a lighter or darker band where the two meet
-- [ ] *(human)* The corners read as Apple's continuous (squircle) curve rather than a cut-off square, and the stack
-      reads as macOS: the head card attached to the bar, and behind it one collapsed pill — one bar tall, the next
-      summary in the secondary colour and `×N` in accent — with a visible gap between the two
-- [ ] *(human)* The head title remains the strongest label on its line, with the shorter source label quiet at the
-      trailing edge; body and action blocks sit below a restrained separator, action labels stay centred inside quiet
-      accent capsules, and overlong labels cannot escape them
-- [ ] *(human)* `notify-send -r <id>` on a visible card updates it in place, without replaying the stretch
-- [ ] *(human)* The bar's text sits comfortably inside the pill: float it against a screenshot and mirror the image,
-      the left and right gaps should read the same (`docs/smoke.md`)
-- [ ] *(human)* `notify-send -u critical ...` does not auto-dismiss; `notify-send -t 2000 ...` disappears after 2 seconds
-      (the harness drives the same D-Bus API with `gdbus`; `notify-send` itself is not installed here)
-- [ ] *(human)* `powertop`/`perf stat`: no sustained 60fps wakeups (the harness measures CPU time as a proxy: < 50 ticks
-      per 5 idle seconds)
-- [ ] *(human)* Multi-monitor with a real second output: focus output B, send a notification, and confirm the
-      notification surface appears on B; this checks the compositor's focused-output layer-shell default
-
-### Known compromises (read first)
-
-- **Multi-monitor**: the notification surface is created with `output = null`; on river + tailrace the compositor
-  resolves that to the focused output's layer-shell default, and `surface_enter` records the actual output for layout.
-  The choice is made when the surface is created; an already mapped surface does not migrate automatically if focus
-  changes later. Live migration would require a WM-provided focus-change signal, which is outside this client-only
-  scope.
-- **Target-environment gap**: passing section 3 on sway does not mean passing on river + tailrace (river's layer-shell is forwarded by the WM).
+- Sway uses wlroots' native layer-shell. River forwards it through the WM, so passing sway does not prove river compatibility.
+- The development sandbox may not contain river, tailrace, a usable GPU/device input stack, or a screenshot session. Never report those checks as passed unless they were actually run.
+- Visual motion is judged by a human. Logged rects or screenshots can confirm geometry, but not whether the spring feels right.

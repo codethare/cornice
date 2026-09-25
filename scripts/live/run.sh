@@ -88,9 +88,7 @@ up() { # up [n_outputs]
     sleep 1
     rm -rf "$W/run" "$W/cfg"; mkdir -p "$W/run" "$W/cfg/cornice"; chmod 700 "$W/run"
     cat > "$W/cfg/cornice/config.toml" <<'EOF'
-# enter_ms is deliberately long (1500 ms, the default is 220): the "a replace must not replay the enter
-# animation" check needs to see a half-grown card 500 ms after a Notify, which grim's ~60 ms latency and
-# the default 220 ms animation turn into a race.
+# enter_ms is deliberately long so the per-card scale/fade can be sampled by grim.
 [bar]
 height   = 30
 margin   = 0
@@ -104,9 +102,10 @@ accent     = "#88c0d0"
 radius     = 15
 
 [notification]
+position = "right"
 max_visible = 4
-enter_ms    = 1500
-exit_ms     = 400
+enter_ms = 1500
+exit_ms = 400
 
 [bar.left]
 modules = [ { kind = "clock", format = "%H:%M" } ]
@@ -115,7 +114,7 @@ modules = [ { kind = "clock", format = "%H:%M" } ]
 modules = [ { kind = "exec", command = "echo mid", format = "{out}" } ]
 
 [bar.right]
-modules = [ { kind = "exec", command = "echo 42", format = "L{out}" }, { kind = "notification" } ]
+modules = [ { kind = "exec", command = "echo 42", format = "L{out}" } ]
 EOF
     XDG_RUNTIME_DIR=$W/run WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=$n WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
         setsid "$RIVER_BIN" -c "$TAILRACE_BIN" -log-level debug >"$W/river.log" 2>&1 </dev/null &
@@ -233,68 +232,57 @@ eq $GAP "$wx0" "window left edge == tailrace horizontal_gap ($GAP)"
 eq $((BAR_H + GAP)) "$wy0" "window top edge == bar height + gap (exclusive zone reached the WM)"
 ge 100000 "$wcount" "window is actually rendered"
 
-sec "notifications: card in the bar, stretch, timeout, urgency"
-# The probe toplevel from the section above would fill everything below the bar with green, so the card's own
-# pixels could not be measured: stop it here, and start a fresh one for the click-through check.
+sec "notifications: independent cards below the bar"
+# The probe toplevel from the section above fills everything below the bar with green, so stop it before
+# measuring the translucent card material. A fresh toplevel is started in the click-through section.
 stop_tree "${win_bg:-}"; win_bg=
 bands() { px bands "$W/$1.ppm" "$((OUT_W - 20))" $((BAR_H + 1)) "$OUT_H"; }
 close_all
 read -r _ _ _ _ bar_ink < <(px near "$W/bar.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
 
-# "The first card is shown in the bar": a card whose rows fit lives entirely inside it.
 n1=$(notify cornice-test 0 "" "Short summary" "" "[]" "{}" 0)
 sleep 1.8
 shot short
-read -r _ _ _ _ short_ink < <(px near "$W/short.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
-ge $((bar_ink + 20)) "$short_ink" "the first card's summary is drawn inside the bar ($bar_ink -> $short_ink ink px)"
-read -r _ _ _ _ short_below < <(card_region "$W/short.ppm")
-eq 0 "$short_below" "a card that fits in the bar paints nothing below it"
+read -r short_x0 short_y0 short_x1 short_y1 short_count < <(card_region "$W/short.ppm")
+ge 1 "$short_count" "a one-line notification creates a card"
+eq $((OUT_W - 12 - 300)) "$short_x0" "right-anchored card starts at the derived 2*card_gap inset"
+eq $((OUT_W - 13)) "$short_x1" "…and ends one pixel before its fixed-width edge"
+eq $((BAR_H + 6)) "$short_y0" "the card starts one card_gap below the bar"
+eq $((short_y0 + 74)) "$short_y1" "a short card uses the derived 2.5*height minimum"
+read -r _ _ _ _ gap_above < <(region "$W/short.ppm" 900 "$BAR_H" "$OUT_W" "$short_y0")
+eq 0 "$gap_above" "the independent card does not touch or merge with the bar"
+read -r _ _ _ _ short_bar_ink < <(px near "$W/short.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
+eq "$bar_ink" "$short_bar_ink" "notification arrival does not change the bar"
 close_all
 
-# "If it is too long, it stretches downwards", and the background stays one piece with the bar.
 n2=$(notify cornice-test 0 "" "Long" $'one\ntwo\nthree' "[]" "{}" 0)
 sleep 1.8
 shot long
 read -r long_x0 _ long_x1 long_y1 long_count < <(card_region "$W/long.ppm")
-ge 1 "$long_count" "a body that does not fit in the bar stretches the card below it"
-ge $((BAR_H + 20)) "$long_y1" "…down to the last body row ($long_y1)"
-# The stretch attaches to the straight part of the pill's bottom edge: radius (15) in from the right end.
-# (bbox max x is right()-1, so the expected value is output_w - radius - 1.)
-eq $((OUT_W - 16)) "$long_x1" "the stretch stops where the pill's bottom edge starts to curve (${long_x0}..${long_x1})"
-eq 1 "$(px bands "$W/long.ppm" $((long_x1 - 20)) 0 $((long_y1 + 1)))" "the bar and the stretched card are one unbroken piece"
+ge 1 "$long_count" "a body grows the same independent card"
+eq "$short_x0" "$long_x0" "short and long cards keep the same fixed-width left edge"
+eq "$short_x1" "$long_x1" "short and long cards keep the same fixed-width right edge"
+ge $((short_y1 + 1)) "$long_y1" "multi-line content increases card height"
 
-# "Everything behind the first collapses into one peek pill": the remainder is not a second full card. A column
-# of full cards grows along the screen's scarce axis, and on a 16:9 output the last of four lands on the vertical
-# midline, inside the user's focus. The pill is the bar's own compact shape: one bar tall, `theme.radius` corners.
 n3=$(notify cornice-test 0 "" "Second" "also here" "[]" "{}" 0)
 sleep 1.8
 shot two
 read -r _ _ _ two_y1 _ < <(card_region "$W/two.ppm")
-# The pill's top edge is one bar above the stack's bottom, so `card_gap` (height/5 = 6) above it is the gap and
-# must be background. Were the pill any taller, this window would land inside it and find pixels.
-pill_top=$(( two_y1 - BAR_H + 1 ))
-read -r _ _ _ _ gapn < <(region "$W/two.ppm" 900 $((pill_top - 6)) 1280 "$pill_top")
-eq 0 "$gapn" "the peek pill is exactly one bar tall (the card_gap above it is background)"
-# Mid-card: the head card's bottom corners are round (radius 1.2 × bar height), so a column near the edge would
-# leave the shape early. Only the junction is scanned, so the check does not depend on how tall the head card is.
-mid=$(( (long_x0 + long_x1) / 2 ))
-eq 1 "$(px bands "$W/two.ppm" $mid 0 $((BAR_H + 6)))" "the head card is one unbroken piece with the bar"
-eq 2 "$(px bands "$W/two.ppm" $mid 0 $((two_y1 + 1)))" "the pill is its own shape one gap below the head card (macOS collapsing stack)"
-# The pill is the same width as a card. Measured against the long card's row 30 rather than the head card here:
-# a 49 px head card is already inside its own 36 px corner curve at row 30, so its bbox is a pixel narrower on
-# each side than the rect it shares with the pill.
-read -r px0 _ px1 _ _ < <(region "$W/two.ppm" 900 "$pill_top" 1280 $((two_y1 + 1)))
-eq "$long_x0" "$px0" "the pill is as wide as the head card (left edge $px0)"
-eq "$long_x1" "$px1" "the pill is as wide as the head card (right edge $px1)"
+ge "$long_y1" "$two_y1" "the second independent card extends the column"
+eq 2 "$(bands two)" "two notifications render as two separate shapes"
+second_top=$((short_y0 + 75 + 6))
+read -r _ _ _ _ inter_gap < <(region "$W/two.ppm" 900 $((second_top - 3)) "$OUT_W" $((second_top - 1)))
+eq 0 "$inter_gap" "independent cards keep one card_gap between them"
+
 n4=$(notify cornice-test 0 "" "Third" "also here" "[]" "{}" 0)
 sleep 1.8
 shot three
 read -r _ _ _ three_y1 _ < <(card_region "$W/three.ppm")
-eq "$two_y1" "$three_y1" "a third notification does not lengthen the stack: the remainder is collapsed, not stacked"
-eq 2 "$(px bands "$W/three.ppm" $mid 0 $((three_y1 + 1)))" "…still exactly two shapes"
+ge "$two_y1" "$three_y1" "a third notification gets its own row"
+eq 3 "$(bands three)" "three notifications render as three separate shapes"
 close_all
 shot nt0
-eq 0 "$(bands nt0)" "CloseNotification removes the card"
+eq 0 "$(bands nt0)" "CloseNotification removes every card"
 
 n4=$(notify cornice-test 0 "" "Fades" "gone in 1.5s" "[]" "{}" 1500)
 sleep 0.6
@@ -311,61 +299,40 @@ shot nt3
 eq 1 "$(bands nt3)" "critical urgency does not auto-dismiss (default timeout)"
 close_all
 
-sec "replace in place does not replay the enter animation"
-# With enter_ms = 1500 a *new* id is still visibly stretching after 500 ms, so a replayed animation after a
-# replace would be caught. Both bodies are five lines long, so the final shape is the same height either way,
-# and the measurement covers the whole column below the bar.
-slot0() { region "$1" 900 $((BAR_H + 1)) 1280 300; }
+sec "replace in place keeps the same notification surface"
 body5=$'a\nb\nc\nd\ne'
 n6=$(notify cornice-test 0 "" "Replace" "$body5" "[]" "{}" 0)
 sleep 1.8
-shot steady
-read -r sx0 sy0 _ sy1 _ < <(slot0 "$W/steady.ppm")
-
 n7=$(notify cornice-test 0 "" "Fresh" "$body5" "[]" "{}" 0)
-sleep 0.5
-shot fresh
-read -r _ _ _ fy1 _ < <(slot0 "$W/fresh.ppm")
-sleep 1.5
+sleep 1.8
 shot fresh_done
-read -r _ _ _ fy1_done _ < <(slot0 "$W/fresh_done.ppm")
+read -r _ _ _ fresh_y1 _ < <(card_region "$W/fresh_done.ppm")
+eq 2 "$(bands fresh_done)" "two notification surfaces are visible"
 
-# Same shape, different text: a replace must not re-run the stretch.
 notify cornice-test "$n7" "" "Fresh" $'v\nw\nx\ny\nz' "[]" "{}" 0 >/dev/null
 sleep 0.5
 shot replaced
-read -r _ _ _ ry1 _ < <(slot0 "$W/replaced.ppm")
-sleep 1.5
-shot replaced_done
-read -r _ _ _ ry1_done _ < <(slot0 "$W/replaced_done.ppm")
-
-echo "  (column bottom edge: steady ${sy1}, new id +500 ms ${fy1} -> ${fy1_done}, replace +500 ms ${ry1} -> ${ry1_done})"
-if [ "$fy1" -lt $((fy1_done - 10)) ]; then
-    ok "control: a new id is still stretching after 500 ms (bottom $fy1 vs final $fy1_done)"
-    if [ "$ry1" -ge $((ry1_done - 3)) ]; then
-        ok "a replace is already at its final rect after 500 ms — the enter animation was not replayed"
-    else
-        bad "a replace replayed the enter animation (bottom $ry1, final $ry1_done)"
-    fi
-else
-    note "control shot was too late to observe the animation (bottom $fy1 vs final $fy1_done), replace not judged"
-fi
-eq 0 "$(closed_pairs | grep -c "^$n7 ")" "a new id emits no NotificationClosed"
+read -r _ _ _ replaced_y1 replaced_count < <(card_region "$W/replaced.ppm")
+ge 1 "$replaced_count" "replaces_id updates the existing card in place"
+ge "$fresh_y1" "$replaced_y1" "the replacement remains at the settled column position"
+eq 0 "$(closed_pairs | grep -c "^$n7 ")" "replaces_id emits no NotificationClosed"
 close_all
 
-sec "queue: depth does not lengthen the stack"
+sec "queue: max_visible cards, then promotion"
 close_all
-# One card, then two: the second notification hangs the pill below the head card. Six leave the same two shapes,
-# so a deep queue no longer walks the stack down the screen.
 notify cornice-test 0 "" "Card 1" "body 1" "[]" "{}" 0 >/dev/null
 sleep 1.8
 shot q1
 read -r _ _ _ q1y _ < <(card_region "$W/q1.ppm")
+eq 1 "$(bands q1)" "one queued notification renders one card"
+
 notify cornice-test 0 "" "Card 2" "body 2" "[]" "{}" 0 >/dev/null
 sleep 1.8
 shot q2
 read -r _ _ _ q2y _ < <(card_region "$W/q2.ppm")
-ge $((q1y + 20)) "$q2y" "a second notification hangs the pill below the head card ($q1y -> $q2y)"
+ge "$q1y" "$q2y" "a second notification extends the independent column"
+eq 2 "$(bands q2)" "both notifications are separate cards"
+
 ids=""
 for i in 3 4 5 6; do
     ids="$ids $(notify cornice-test 0 "" "Card $i" "body $i" "[]" "{}" 0)"
@@ -374,24 +341,22 @@ done
 sleep 1.8
 shot stack
 read -r _ _ _ stack_y1 _ < <(card_region "$W/stack.ppm")
-eq "$q2y" "$stack_y1" "6 notifications leave the same two shapes as 2 (the tail is collapsed)"
-head_id=$(echo $ids | awk '{print $NF}')   # ids run oldest → newest, so the last one is the head card
-close_id "$head_id"
+ge "$q2y" "$stack_y1" "six queued notifications use the full visible column"
+eq 4 "$(bands stack)" "only max_visible=4 cards are drawn"
+
+newest=$(echo $ids | awk '{print $NF}')
+close_id "$newest"
 sleep 0.8
 shot stack2
-read -r _ _ _ stack2_y1 _ < <(card_region "$W/stack2.ppm")
-eq "$stack_y1" "$stack2_y1" "closing the head card slides the pill up into its place"
-eq 2 "$(bands stack2)" "…and the stack is still two shapes"
-if closed_pairs | grep -q "^$head_id 3$"; then ok "CloseNotification on the head emits NotificationClosed(id=$head_id, reason=3)"; else bad "CloseNotification emitted nothing for $head_id: $(closed_pairs | tail -3 | tr '\n' ' ')"; fi
-# A card inside the visible window but past the drawn pair: closing it changes nothing on screen, so it must not
-# start an animation — the shape stays where it is and only the queue advances.
-last=$(echo $ids | awk '{print $1}')
-close_id "$last"
+eq 3 "$(bands stack2)" "closing the newest card leaves three independent cards"
+if closed_pairs | grep -q "^$newest 3$"; then ok "CloseNotification emits reason=3 for $newest"; else bad "no reason=3 for $newest"; fi
+
+oldest=$(echo $ids | awk '{print $1}')
+close_id "$oldest"
 sleep 0.8
 shot stack3
-read -r _ _ _ stack3_y1 _ < <(card_region "$W/stack3.ppm")
-eq "$stack2_y1" "$stack3_y1" "closing a card past the drawn pair leaves the shape where it is"
-if closed_pairs | grep -q "^$last 3$"; then ok "…and it still emits NotificationClosed(id=$last, reason=3)"; else bad "no NotificationClosed(3) for a never-drawn card: $(closed_pairs | tail -3 | tr '\n' ' ')"; fi
+eq 4 "$(bands stack3)" "closing a visible card promotes the next queued notification"
+if closed_pairs | grep -q "^$oldest 3$"; then ok "the promoted queue also preserves close reason=3"; else bad "no reason=3 for $oldest"; fi
 close_all
 
 sec "pointer: card click, action button, click-through"
@@ -437,8 +402,8 @@ setsid env PROBE_COLOR=00ff00 "$PROBE" win >"$W/win.log" 2>&1 </dev/null &
 win_bg=$!
 sleep 1.5
 p0=$(grep -c 'win: pointer button' "$W/win.log")
-# (100,100) is inside the notification surface's full-width band but outside every card,
-# and inside the probe toplevel: the click must reach the toplevel, not cornice.
+# (100,100) is outside the right-anchored card surface and inside the probe toplevel, so the click must
+# reach the toplevel rather than an invisible full-width notification region.
 vp at 100 100
 vp click left
 sleep 0.5

@@ -1,4 +1,4 @@
-//! Wayland connection, layer surface, shm buffers and the main event loop.
+//! Wayland connection, layer surfaces, shm buffers and the main event loop.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -28,29 +28,21 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::anim::{Easing, Tween};
+use crate::config::NotificationPosition;
 use crate::geom::Rect;
+use crate::notify::queue::Notification;
+use crate::notify::view::{Card, Motion};
 use crate::widget::Action;
 
 pub const LAYER_NAMESPACE: &str = "cornice";
-
-/// Animation frame interval (~60fps); used only while animating.
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// The clock's minimum tick resolution; the only wakeup source when idle.
 pub const CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The next instant needing a wakeup: the frame being animated, the clock tick, notification expiry — whichever comes first.
-/// Keep a single timer source that wakes once per second when idle, never spinning at 60fps.
 pub fn next_deadline(now: Instant, animating: bool, next_expiry: Option<Instant>) -> Instant {
-    let mut d = now + CLOCK_INTERVAL;
-    if animating {
-        d = d.min(now + FRAME_INTERVAL);
-    }
-    if let Some(e) = next_expiry {
-        // an already-expired time must not be returned as a past instant, or it becomes a busy wait
-        d = d.min(e.max(now));
-    }
-    d
+    let mut deadline = now + CLOCK_INTERVAL;
+    if animating { deadline = deadline.min(now + FRAME_INTERVAL); }
+    if let Some(expiry) = next_expiry { deadline = deadline.min(expiry.max(now)); }
+    deadline
 }
 
 pub struct Bar {
@@ -67,24 +59,11 @@ pub struct NotifSurface {
     pub width: u32,
     pub height: u32,
     pub configured: bool,
-}
-
-/// The geometric endpoints of the notification animation. Only one animation at a time (see `redraw_notifications`).
-#[derive(Clone)]
-enum AnimKind {
-    /// A new card stretches the stack down; `id` is the notification entering (it must still be at the head).
-    /// `fade` is false when the stack was already open, so only a fresh opening fades its text in.
-    Enter { id: u32, fade: bool },
-    /// A closed/expired card retracts the stack back into the bar, and the rows shift up with it.
-    Exit,
-}
-
-#[derive(Clone)]
-struct Anim {
-    kind: AnimKind,
-    tween: Tween,
-    start: Rect,
-    end: Rect,
+    pub output: Option<wl_output::WlOutput>,
+    pub notification: Notification,
+    pub card: Card,
+    pub motion: Motion,
+    pub hits: Vec<(Rect, Action)>,
 }
 
 pub struct State {
@@ -99,61 +78,42 @@ pub struct State {
     pub bars: HashMap<wl_output::WlOutput, Bar>,
     pub bar_height: u32,
     pub exit: bool,
-    /// Whether an enter/leave animation is running; maintained by `set_anim` and driving the frame source at ~16ms.
     pub animating: bool,
     pub cfg: crate::config::Config,
     pub theme: crate::theme::Theme,
-    /// Text layout engine; used for drawing from Task 5 on, created here to avoid changing `run`'s signature again.
     pub text: crate::text::TextEngine,
-    /// The left/center/right module lists.
     pub sections: crate::bar::Sections,
-    /// The notification queue (pure state; rendering arrives in Task 9).
     pub queue: crate::notify::queue::Queue,
-    /// the D-Bus connection; None when the bus name is taken or the session bus is unreachable (degrade, do not exit).
     pub dbus: Option<zbus::blocking::Connection>,
-    /// Notification layer surface; created while the queue is non-empty, destroyed once it empties.
-    pub notif: Option<NotifSurface>,
-    /// The clickable regions drawn in the last frame (the same data as set_input_region).
-    pub hits: Vec<(Rect, Action)>,
-    /// the in-flight enter/leave animation; at most one at a time. An internal detail; the type is not exposed.
-    anim: Option<Anim>,
-    /// The output the compositor selected for the output-less notification surface; set by `surface_enter`.
-    notif_output: Option<wl_output::WlOutput>,
-    /// An enter animation waiting for the compositor to resolve the notification surface's default output.
-    pending_enter: Option<u32>,
-    /// Registration handle for the frame source: inserted while animating, set to None after it self-Drops when idle.
+    pub notifications: HashMap<u32, NotifSurface>,
     frame_id: Option<RegistrationToken>,
-    /// Event-loop handle so `set_anim` can insert the frame source from any callback.
-    /// `'static` because `State` itself is `'static` (no field borrows a local scope).
     loop_handle: LoopHandle<'static, State>,
 }
 
 pub fn run(cfg: crate::config::Config) -> Result<(), String> {
-    let conn = Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
-    let (globals, event_queue) = registry_queue_init(&conn).map_err(|e| format!("failed to read globals: {e}"))?;
+    let connection = Connection::connect_to_env().map_err(|error| format!("cannot connect to Wayland: {error}"))?;
+    let (globals, event_queue) = registry_queue_init(&connection).map_err(|error| format!("failed to read globals: {error}"))?;
     let qh = event_queue.handle();
-
-    let compositor = CompositorState::bind(&globals, &qh).map_err(|e| format!("missing wl_compositor: {e}"))?;
-    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|e| {
-        format!("layer shell unavailable: {e}\n  on river the WM must implement river-layer-shell-v1 (tailrace does)")
+    let compositor = CompositorState::bind(&globals, &qh).map_err(|error| format!("missing wl_compositor: {error}"))?;
+    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|error| {
+        format!("layer shell unavailable: {error}\n  on river the WM must implement river-layer-shell-v1 (tailrace does)")
     })?;
-    let shm = Shm::bind(&globals, &qh).map_err(|e| format!("missing wl_shm: {e}"))?;
+    let shm = Shm::bind(&globals, &qh).map_err(|error| format!("missing wl_shm: {error}"))?;
 
     let bar_height = cfg.bar.height as u32;
     let theme = cfg.theme.clone();
     let (sections, exec_rx) = crate::bar::Sections::from_config(&cfg);
-    let max_visible = cfg.notification.max_visible;
-    let (notif_tx, notif_rx) = calloop::channel::channel::<crate::notify::queue::Request>();
-    let dbus = match crate::notify::service::spawn(notif_tx) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("cornice: notifications unavailable: {e}");
+    let max_visible = cfg.notification.as_ref().map_or(1, |notification| notification.max_visible);
+    let (notification_tx, notification_rx) = calloop::channel::channel::<crate::notify::queue::Request>();
+    let dbus = match crate::notify::service::spawn(notification_tx) {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            eprintln!("cornice: notifications unavailable: {error}");
             None
         }
     };
-    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new().map_err(|e| format!("failed to create the event loop: {e}"))?;
+    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new().map_err(|error| format!("failed to create the event loop: {error}"))?;
     let handle = event_loop.handle();
-
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -173,52 +133,37 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         sections,
         queue: crate::notify::queue::Queue::new(max_visible),
         dbus,
-        notif: None,
-        hits: Vec::new(),
-        anim: None,
-        notif_output: None,
-        pending_enter: None,
+        notifications: HashMap::new(),
         frame_id: None,
         loop_handle: handle.clone(),
     };
-    WaylandSource::new(conn, event_queue).insert(handle.clone()).map_err(|e| format!("failed to insert the wayland source: {e}"))?;
-    handle.insert_source(exec_rx, |msg, _meta, state: &mut State| {
-        let calloop::channel::Event::Msg(ev) = msg else { return };
-        if state.sections.update(&ev) { state.redraw_all(); }
-    }).map_err(|e| format!("failed to insert the exec channel: {e}"))?;
 
-    handle.insert_source(notif_rx, |msg, _meta, state: &mut State| {
-        let calloop::channel::Event::Msg(req) = msg else { return };
+    WaylandSource::new(connection, event_queue).insert(handle.clone()).map_err(|error| format!("failed to insert the wayland source: {error}"))?;
+    handle.insert_source(exec_rx, |message, _metadata, state: &mut State| {
+        let calloop::channel::Event::Msg(event) = message else { return };
+        if state.sections.update(&event) { state.redraw_all(); }
+    }).map_err(|error| format!("failed to insert the exec channel: {error}"))?;
+    handle.insert_source(notification_rx, |message, _metadata, state: &mut State| {
+        let calloop::channel::Event::Msg(request) = message else { return };
         let now = Instant::now();
-        match state.queue.apply(req, now) {
-            crate::notify::queue::Outcome::Added(id) => {
-                state.start_enter(id, now);
-                state.redraw_notifications(now);
-            }
-            // An in-place replace does not replay the animation (design §6), it only redraws.
-            crate::notify::queue::Outcome::Replaced(_) => state.redraw_notifications(now),
-            crate::notify::queue::Outcome::CloseRequested(id) => {
-                state.close_visible(id, 3, now);
-                state.redraw_notifications(now);
-            }
-            crate::notify::queue::Outcome::Ignored => {}
+        let changed = match state.queue.apply(request, now) {
+            crate::notify::queue::Outcome::Added(_) | crate::notify::queue::Outcome::Replaced(_) => true,
+            crate::notify::queue::Outcome::CloseRequested(id) => state.remove_notification(id, 3),
+            crate::notify::queue::Outcome::Ignored => false,
+        };
+        if changed {
+            state.sync_notifications(now);
+            state.redraw_notifications(now);
         }
-    }).map_err(|e| format!("failed to insert the notification channel: {e}"))?;
-
-    // Idle timer: handles the per-second clock tick and notification expiry only; animation frames come from a separate frame source (see ensure_frame_source).
-    // so animating is passed as a fixed false here — otherwise it would form two 16ms sources with the frame source during animation.
-    // A calloop timer's event is the *deadline* it was scheduled for, not the current time (calloop-0.14
-    // sources/timer.rs: "can be earlier than the current time depending on the event loop congestion"), and
-    // `ToInstant(deadline + 16ms)` lets that deadline fall further behind on every slow frame. tweening and
-    // expiry compare it against `Instant::now()` stamps, so the deadline is not a usable clock here: take the clock here.
-    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |_deadline, _meta, state: &mut State| {
+    }).map_err(|error| format!("failed to insert the notification channel: {error}"))?;
+    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |_deadline, _metadata, state: &mut State| {
         let now = Instant::now();
         state.on_wake(now);
         TimeoutAction::ToInstant(next_deadline(now, false, state.queue.next_expiry()))
-    }).map_err(|e| format!("failed to insert the timer: {e}"))?;
+    }).map_err(|error| format!("failed to insert the idle timer: {error}"))?;
 
     while !state.exit {
-        event_loop.dispatch(None, &mut state).map_err(|e| format!("event loop error: {e}"))?;
+        event_loop.dispatch(None, &mut state).map_err(|error| format!("event loop error: {error}"))?;
     }
     Ok(())
 }
@@ -229,586 +174,354 @@ impl State {
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some(LAYER_NAMESPACE), Some(&output));
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        // The margin is vertical only (top): this keeps the horizontal coordinate systems of the bar and notification surface identical (both span the full width),
-        // the stretch's column x/w come from the same `BarLayout` slot on both surfaces only then; a horizontal inset would break that premise, so it is deliberately unsupported.
         layer.set_margin(self.cfg.bar.margin, 0, 0, 0);
-        // Design §3: exclusive_zone = bar height + 2×margin (a margin above and below).
         layer.set_exclusive_zone(self.bar_height as i32 + 2 * self.cfg.bar.margin);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(0, self.bar_height); // width 0 + both horizontal anchors = the compositor gives full width
+        layer.set_size(0, self.bar_height);
         layer.commit();
-        let pool = SlotPool::new((self.bar_height as usize) * 4096 * 4, &self.shm).expect("failed to create the shm pool");
+        let pool = SlotPool::new(self.bar_height as usize * 4096 * 4, &self.shm).expect("failed to create the bar shm pool");
         self.bars.insert(output, Bar { layer, pool, width: 0, height: self.bar_height, configured: false });
     }
 
-    /// Redraw the bar on every output once.
     pub fn redraw_all(&mut self) {
         let outputs: Vec<_> = self.bars.keys().cloned().collect();
-        for o in outputs { self.redraw(&o); }
+        for output in outputs { self.redraw(&output); }
     }
 
-    /// Timer fired: clean up expired notifications (visible ones play the leave animation), step animations, refresh the clock.
-    /// exec output goes through the channel and never passes through here.
-    fn on_wake(&mut self, now: Instant) {
-        // Expire first, then compute the next wakeup: when the expiry lands in the past,
-        // e.max(now) in next_deadline returns now, and ToInstant(now) becomes a busy loop.
-        let visible_expired: Vec<u32> = self.queue.visible()
-            .iter()
-            .filter(|n| n.expire.is_some_and(|d| now.saturating_duration_since(n.created) >= d))
-            .map(|n| n.id)
-            .collect();
-        for id in visible_expired {
-            self.close_visible(id, 1, now);
-        }
-        // An invisible expired entry (outside the visible window) has no leave animation: clear it and emit the close signal.
-        for id in self.queue.expire(now) {
-            if let Some(c) = &self.dbus {
-                let _ = crate::notify::service::emit_closed(c, id, 1);
+    fn notification_settings(&self) -> Option<(NotificationPosition, u64, u64)> {
+        self.cfg.notification.as_ref().map(|notification| (notification.position, notification.enter_ms, notification.exit_ms))
+    }
+
+    fn create_notification_surface(&mut self, card: Card, notification: Notification, now: Instant, enter_ms: u64) {
+        let Some((position, _, _)) = self.notification_settings() else { return };
+        let qh = self.qh.clone();
+        let surface = self.compositor.create_surface(&qh);
+        let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(LAYER_NAMESPACE), None);
+        let anchor = match position {
+            NotificationPosition::Left => Anchor::TOP | Anchor::LEFT,
+            NotificationPosition::Center => Anchor::TOP,
+            NotificationPosition::Right => Anchor::TOP | Anchor::RIGHT,
+        };
+        let side = crate::notify::view::side_margin(&self.theme);
+        layer.set_anchor(anchor);
+        layer.set_margin(
+            crate::notify::view::surface_top(&self.theme, self.cfg.bar.margin, card.top),
+            if position == NotificationPosition::Left { side } else { 0 },
+            if position == NotificationPosition::Right { side } else { 0 },
+            0,
+        );
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(card.rect.w as u32, card.rect.h as u32);
+        layer.commit();
+        let pool = SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm).expect("failed to create the notification shm pool");
+        let motion = Motion::new(now, card.top, enter_ms);
+        self.notifications.insert(notification.id, NotifSurface {
+            layer,
+            pool,
+            width: 0,
+            height: 0,
+            configured: false,
+            output: None,
+            notification,
+            card,
+            motion,
+            hits: Vec::new(),
+        });
+    }
+
+    /// Reconcile protocol surfaces with queue state. Live cards get their content and target top; cards that
+    /// left the queue keep a private copy long enough to animate out.
+    fn sync_notifications(&mut self, now: Instant) -> bool {
+        let Some((_, enter_ms, exit_ms)) = self.notification_settings() else {
+            let changed = !self.notifications.is_empty();
+            self.notifications.clear();
+            self.animating = false;
+            return changed;
+        };
+        let mut changed = false;
+
+        for surface in self.notifications.values_mut() {
+            let live = self.queue.visible().iter().any(|notification| notification.id == surface.card.id);
+            if !live && !surface.motion.is_exiting() {
+                surface.motion.begin_exit(now, exit_ms);
+                changed = true;
             }
         }
-        // Refresh the clock/bar layout first: the stretch's column follows the latest slot (the clock ticking moves the modules beside it).
-        if self.sections.update(&crate::widget::Event::Wake) {
-            self.redraw_all();
+
+        let live_cards = crate::notify::view::cards(self.queue.visible(), &self.theme);
+        let mut missing = Vec::new();
+        for card in live_cards {
+            let Some(notification) = self.queue.visible().iter().find(|notification| notification.id == card.id) else { continue };
+            if self.notifications.contains_key(&card.id) {
+                let resize = self.notifications.get(&card.id).is_some_and(|surface| surface.card.rect != card.rect);
+                let pool = resize.then(|| SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm).expect("failed to resize the notification shm pool"));
+                if let Some(surface) = self.notifications.get_mut(&card.id) {
+                    changed |= surface.notification != *notification;
+                    surface.notification = notification.clone();
+                    surface.card = card;
+                    if let Some(pool) = pool {
+                        surface.configured = false;
+                        surface.width = 0;
+                        surface.height = 0;
+                        surface.hits.clear();
+                        surface.pool = pool;
+                        surface.layer.set_size(surface.card.rect.w as u32, surface.card.rect.h as u32);
+                        surface.layer.commit();
+                        changed = true;
+                    }
+                    changed |= surface.motion.retarget(now, surface.card.top, enter_ms);
+                }
+            } else {
+                missing.push((card, notification.clone()));
+            }
         }
-        // Then draw notifications: while animating, step at a 16ms cadence; once done, redraw_notifications clears animating.
-        if self.animating {
-            self.redraw_notifications(now);
+        for (card, notification) in missing {
+            self.create_notification_surface(card, notification, now, enter_ms);
+            changed = true;
         }
+
+        let completed: Vec<_> = self.notifications.iter()
+            .filter(|(_, surface)| surface.motion.is_exiting() && !surface.motion.is_animating(now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in completed {
+            self.notifications.remove(&id);
+            changed = true;
+        }
+
+        self.animating = self.notifications.values().any(|surface| surface.motion.is_animating(now));
+        if self.animating { self.ensure_frame_source(); }
+        changed
     }
 
-    /// Set/clear the animation and maintain `animating` in the same change, otherwise
-    /// Leaving `animating` true would spin the timer at 16ms forever (ruling #9).
-    fn set_anim(&mut self, anim: Option<Anim>) {
-        self.animating = anim.is_some();
-        self.anim = anim;
-        if self.animating {
-            self.ensure_frame_source();
-        }
-    }
-
-    /// Frame source: drives `on_wake` at ~16ms while animating; when idle the callback does its own `TimeoutAction::Drop`.
-    /// Make sure it exists whenever `animating` flips from false to true — whichever callback starts the animation
-    /// (notification channel, pointer clicks, expiry cleanup). Otherwise the single idle timer may sleep for up to 1s before waking,
-    /// while enter/leave lasts only 160~220ms, so the tween has long finished and the card jumps (final review Critical #1).
     fn ensure_frame_source(&mut self) {
-        if self.frame_id.is_some() || !self.animating {
-            return;
-        }
+        if self.frame_id.is_some() || !self.animating { return; }
         let token = self.loop_handle.insert_source(
             Timer::from_duration(FRAME_INTERVAL),
-            |_deadline, _meta, state: &mut State| {
-                let now = Instant::now(); // the deadline drifts behind real time on slow frames; see the idle timer above
+            |_deadline, _metadata, state: &mut State| {
+                let now = Instant::now();
                 state.on_wake(now);
                 if state.animating {
                     TimeoutAction::ToInstant(now + FRAME_INTERVAL)
                 } else {
-                    // Animation finished: clear the registration; the source removes itself after the callback returns (TimeoutAction::Drop → PostAction::Remove).
                     state.frame_id = None;
                     TimeoutAction::Drop
                 }
             },
         );
-        if let Ok(token) = token {
-            self.frame_id = Some(token);
+        if let Ok(token) = token { self.frame_id = Some(token); }
+    }
+
+    fn on_wake(&mut self, now: Instant) {
+        let mut changed = false;
+        let visible_expired: Vec<_> = self.queue.visible().iter()
+            .filter(|notification| notification.expire.is_some_and(|duration| now.saturating_duration_since(notification.created) >= duration))
+            .map(|notification| notification.id)
+            .collect();
+        for id in visible_expired { changed |= self.remove_notification(id, 1); }
+        for id in self.queue.expire(now) {
+            if let Some(connection) = &self.dbus { let _ = crate::notify::service::emit_closed(connection, id, 1); }
         }
+        if self.sections.update(&crate::widget::Event::Wake) { self.redraw_all(); }
+        changed |= self.sync_notifications(now);
+        if changed || self.animating { self.redraw_notifications(now); }
     }
 
-    /// The output selected by the compositor for the notification surface. An output-less layer surface is
-    /// deliberately used so river + tailrace can route it to the focused output's layer-shell default.
-    fn notif_target(&self) -> Option<wl_output::WlOutput> {
-        self.notif_output.clone()
+    fn remove_notification(&mut self, id: u32, reason: u32) -> bool {
+        if self.queue.remove(id).is_none() { return false; }
+        if let Some(connection) = &self.dbus { let _ = crate::notify::service::emit_closed(connection, id, reason); }
+        true
     }
 
-    /// The bar width (full width) of the output the notification surface should target.
-    fn notif_output_width(&self) -> Option<i32> {
-        self.notif_target().and_then(|o| self.bars.get(&o)).and_then(|b| (b.width > 0).then_some(b.width as i32))
-    }
-
-    /// The output's logical height — the budget the notification stack borrows before it is capped.
-    /// `logical_size` needs zxdg-output; a compositor without it still advertises the current mode.
-    fn notif_output_height(&self) -> Option<i32> {
-        let info = self.output_state.info(&self.notif_target()?)?;
-        info.logical_size.or_else(|| info.modes.iter().find(|m| m.current).map(|m| m.dimensions)).map(|(_, h)| h)
-    }
-
-    /// Notification surface height: the bar plus the worst-case tail of one card and one peek pill, capped by
-    /// the output when the compositor has selected it (see `view::max_tail`). Before `surface_enter`, this is
-    /// an uncapped pool bound; the real layer size is requested once the output is known.
-    fn notif_surface_height(&mut self) -> u32 {
-        let output_h = self.notif_output_height();
-        let tail = crate::notify::view::max_tail(&self.theme, &mut self.text, output_h);
-        let h = self.cfg.bar.margin + self.cfg.bar.height + tail;
-        h.max(1) as u32
-    }
-
-    /// The stack of visible notifications: the notification module's slot is where it hangs off the bar.
-    /// `None` when the module is not configured, which is what turns the notification cards off entirely.
-    fn notif_stack(&mut self, output_w: i32) -> Option<crate::notify::view::Stack> {
-        let at = self.sections.notif_at()?;
-        let queued = self.queue.len();
-        let w = crate::notify::view::slot_width(self.queue.visible(), &self.theme);
-        if w != self.sections.notif_width() {
-            // The card's width is reserved in the bar, so the bar re-lays out with it.
-            self.sections.set_notif_width(w);
-            self.redraw_all();
-        }
-        let widths = self.sections.widths(&mut self.text, &self.theme);
-        let bar = crate::bar::layout(&widths, output_w, &self.theme);
-        let slot = bar.slot(at)?;
-        Some(crate::notify::view::stack(self.queue.visible(), queued, slot.x, output_w, &self.theme, &mut self.text))
-    }
-
-    /// Make sure the notification surface exists while the queue is non-empty or a leave animation is running.
-    fn ensure_notif_surface(&mut self) {
-        if self.notif.is_some() { return; }
-        let qh = self.qh.clone();
-        let surface = self.compositor.create_surface(&qh);
-        // No output: river + tailrace resolves this to the focused output's layer-shell default. The
-        // compositor reports the choice through wl_surface.enter, after which the real size is requested.
-        let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(LAYER_NAMESPACE), None);
-        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_margin(self.cfg.bar.margin, 0, 0, 0);
-        layer.set_exclusive_zone(-1); // takes no space
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        let pool_height = self.notif_surface_height(); // uncapped until surface_enter supplies an output
-        layer.set_size(0, 1); // wait for the selected output before requesting the real height
-        layer.commit();
-        let pool = SlotPool::new((pool_height as usize) * 4096 * 4, &self.shm).expect("failed to create the notification shm pool");
-        self.notif = Some(NotifSurface { layer, pool, width: 0, height: 1, configured: false });
-    }
-
-    /// Destroy the notification surface. sctk 0.21's LayerSurface has no destroy(); its Drop destroys the proxy.
-    fn destroy_notif_surface(&mut self) {
-        self.notif = None;
-        self.hits.clear();
-        self.notif_output = None;
-    }
-
-    /// Start the enter animation (the id must be the one just inserted at the head).
-    fn start_enter(&mut self, id: u32, now: Instant) {
-        if !self.queue.visible().first().is_some_and(|n| n.id == id) {
-            self.pending_enter = None;
-            return;
-        }
-        let Some(output_w) = self.notif_output_width() else {
-            self.pending_enter = Some(id);
-            return;
-        };
-        self.pending_enter = None;
-        let Some(stack) = self.notif_stack(output_w) else { return };
-        // Apple's island opens onto the bar and stays open: a notification arriving while it is open *extends* it
-        // (`Update a Live Activity only when new content is available`), so the tween starts from the shape that is
-        // on screen instead of replaying the opening from the bar's row. Only a fresh opening fades its text in.
-        let open = self.anim.as_ref().filter(|a| matches!(a.kind, AnimKind::Enter { .. })).map(|a| (a.start, a.end, a.tween, now));
-        let (start, fade) = match open {
-            Some((s, e, tw, at)) => (crate::notify::view::stretch(s, e, Easing::Spring, &tw, at), false),
-            None => (Rect::new(stack.rect.x, 0, stack.rect.w, self.theme.height), true),
-        };
-        self.set_anim(Some(Anim {
-            kind: AnimKind::Enter { id, fade },
-            tween: Tween::new(now, self.cfg.notification.enter_ms),
-            start,
-            end: stack.rect,
-        }));
-    }
-
-    /// Remove an entry that is not on screen and emit its close signal: there is nothing to animate.
-    fn drop_silently(&mut self, id: u32, reason: u32) {
-        if self.queue.remove(id).is_some() {
-            if let Some(c) = &self.dbus {
-                let _ = crate::notify::service::emit_closed(c, id, reason);
-            }
-        }
-    }
-
-    /// Close one notification and emit the signal; if it is on screen, play the leave animation.
-    fn close_visible(&mut self, id: u32, reason: u32, now: Instant) {
-        // No bar, no notification module, or an entry outside the visible window: no animation.
-        let Some(output_w) = self.notif_output_width().filter(|_| self.sections.notif_at().is_some()) else {
-            return self.drop_silently(id, reason);
-        };
-        if !self.queue.visible().iter().any(|n| n.id == id) {
-            return self.drop_silently(id, reason);
-        }
-        let Some(stack) = self.notif_stack(output_w) else { return self.drop_silently(id, reason) };
-        let start = stack.rect;
-        // The card leaves the queue right away: the remaining rows shift up and the shape retracts over them.
-        if self.queue.remove(id).is_none() {
-            return;
-        }
-        // An empty queue has no stack left to aim at, so the shape keeps its width and only drops its tail.
-        let end = self
-            .notif_stack(output_w)
-            .filter(|_| !self.queue.is_empty())
-            .map_or(Rect::new(start.x, 0, start.w, self.theme.height), |s| s.rect);
-        if end == start {
-            // Nothing on screen moves: closing the peek pill, or an entry past the drawn pair, leaves the shape
-            // exactly where it is, so there is nothing to animate — only the new head/peek content to draw.
-            self.redraw_notifications(now);
-        } else {
-            self.set_anim(Some(Anim {
-                kind: AnimKind::Exit,
-                tween: Tween::new(now, self.cfg.notification.exit_ms),
-                start,
-                end,
-            }));
-        }
-        if let Some(c) = &self.dbus {
-            let _ = crate::notify::service::emit_closed(c, id, reason);
-        }
-    }
-
-    /// Redraw the notification surface: lifetime, animation stepping, the stretch and the input region in one pass.
     fn redraw_notifications(&mut self, now: Instant) {
-        // 1. Finish animations: done, or the Enter id is no longer at the head (displaced/closed).
-        let mut drop_anim = false;
-        if let Some(anim) = &self.anim {
-            if anim.tween.is_done(now) {
-                drop_anim = true;
-            } else if let AnimKind::Enter { id, .. } = anim.kind {
-                if !self.queue.visible().first().is_some_and(|n| n.id == id) {
-                    drop_anim = true;
+        let Some((_, _, _)) = self.notification_settings() else { return };
+        if self.notifications.is_empty() { return; }
+        let side = crate::notify::view::side_margin(&self.theme);
+        let position = self.notification_settings().map(|settings| settings.0).expect("settings exist");
+
+        for notification in self.notifications.values_mut() {
+            let top = crate::notify::view::surface_top(&self.theme, self.cfg.bar.margin, notification.motion.top(now));
+            notification.layer.set_margin(
+                top,
+                if position == NotificationPosition::Left { side } else { 0 },
+                if position == NotificationPosition::Right { side } else { 0 },
+                0,
+            );
+            if !notification.configured || notification.width == 0 || notification.height == 0 { continue; }
+
+            let width = notification.width as i32;
+            let height = notification.height as i32;
+            let visual = notification.motion.visual(now, notification.card.rect.w, notification.card.rect.h);
+            let (buffer, data) = notification.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
+                .expect("failed to create the notification buffer");
+            let mut canvas = crate::canvas::Canvas::new(data, width, height);
+            canvas.clear();
+            canvas.set_clip(Some(visual.rect));
+            crate::notify::view::render_background(&mut canvas, visual, &self.theme);
+            let card_hits = crate::notify::view::render(&mut canvas, &notification.card, visual.alpha, &notification.notification, &self.theme, &mut self.text);
+            canvas.set_clip(None);
+
+            let mut hits = Vec::new();
+            if !notification.motion.is_exiting() && visual.alpha > 0.0 {
+                for (rect, action) in card_hits {
+                    let visible = rect.intersect(visual.rect);
+                    if !visible.is_empty() { hits.push((visible, action)); }
                 }
+                hits.push((visual.rect, Action::NotificationClose(notification.card.id)));
             }
-        }
-        if drop_anim {
-            self.set_anim(None);
-        }
 
-        // 2. No notification module configured: the stretch has nowhere to hang off the bar, so nothing is drawn
-        // (the D-Bus daemon still runs and the queue still expires).
-        if self.sections.notif_at().is_none() {
-            if self.notif.is_some() {
-                self.destroy_notif_surface();
-                self.sections.set_notif_width(0);
-                self.redraw_all();
-            }
-            return;
+            let region = Region::new(&self.compositor).expect("failed to create the notification input region");
+            for (rect, _) in &hits { region.add(rect.x, rect.y, rect.w, rect.h); }
+            notification.layer.set_input_region(Some(region.wl_region()));
+            notification.layer.wl_surface().damage_buffer(0, 0, width, height);
+            buffer.attach_to(notification.layer.wl_surface()).expect("attach failed");
+            notification.layer.commit();
+            notification.hits = hits;
         }
-
-        // 3. Queue empty and no leave animation → destroy the surface; the bar takes its space back.
-        let exit_in_flight = matches!(&self.anim, Some(a) if matches!(a.kind, AnimKind::Exit));
-        if self.queue.is_empty() && !exit_in_flight {
-            self.pending_enter = None;
-            if self.notif.is_some() {
-                self.destroy_notif_surface();
-            }
-            if self.sections.notif_width() != 0 {
-                self.sections.set_notif_width(0);
-                self.redraw_all();
-            }
-            return;
-        }
-
-        // 4. Make sure the surface exists.
-        self.ensure_notif_surface();
-        let Some(output_w) = self.notif_output_width() else { return };
-        if self.anim.is_none() {
-            if let Some(id) = self.pending_enter.take() {
-                self.start_enter(id, now);
-            }
-        }
-
-        // 5. Geometry (independent of whether the surface is configured; uses the bar width).
-        let Some(stack) = self.notif_stack(output_w) else { return };
-        // The enter's endpoint follows the latest layout: another notification extends the stack while it is open.
-        if let Some(anim) = self.anim.as_mut() {
-            if matches!(&anim.kind, AnimKind::Enter { .. }) {
-                anim.end = stack.rect;
-            }
-        }
-        // The shape this frame: the tween's interpolation, or the laid-out stack when nothing is animating.
-        let shape = match &self.anim {
-            Some(a) => match a.kind {
-                AnimKind::Enter { .. } => crate::notify::view::stretch(a.start, a.end, Easing::Spring, &a.tween, now),
-                AnimKind::Exit => crate::notify::view::stretch(a.start, a.end, Easing::Smooth, &a.tween, now),
-            },
-            None => stack.rect,
-        };
-        // Only a fresh opening fades its text in: an extended stack keeps the rows that were already visible.
-        let head_alpha = match &self.anim {
-            Some(a) if matches!(a.kind, AnimKind::Enter { fade: true, .. }) => {
-                let t = a.tween.progress(now);
-                ((t - 0.35) / 0.65).clamp(0.0, 1.0)
-            }
-            _ => 1.0,
-        };
-
-        // 6. Draw.
-        let Some(notif) = self.notif.as_mut() else { return };
-        if !notif.configured || notif.width == 0 {
-            return; // wait for the configure callback
-        }
-        let w = notif.width as i32;
-        let h = notif.height as i32;
-        let (buffer, canvas) = notif.pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).expect("failed to create the notification buffer");
-        let mut c = crate::canvas::Canvas::new(canvas, w, h);
-        c.clear();
-        let shape = shape.intersect(Rect::new(0, 0, w, h));
-        for (i, card) in stack.cards.iter().enumerate() {
-            crate::notify::view::render_card_background(&mut c, card, i == 0, self.theme.height, shape, &self.theme);
-        }
-        c.set_clip(Some(shape));
-
-        let mut hits: Vec<(Rect, Action)> = Vec::new();
-        for (i, n) in self.queue.visible().iter().enumerate() {
-            let Some(card) = stack.cards.get(i) else { break };
-            let area = card.rect.intersect(shape);
-            if area.is_empty() {
-                continue;
-            }
-            let mut card_hits = crate::notify::view::render(&mut c, card, if i == 0 { head_alpha } else { 1.0 }, n, &self.theme, &mut self.text);
-            hits.append(&mut card_hits); // buttons first
-            hits.push((area, Action::NotificationClose(n.id))); // card body after
-        }
-        c.set_clip(None);
-
-        // Input region: always Some (an empty region responds to nothing; None makes the whole surface swallow clicks).
-        let region = Region::new(&self.compositor).expect("failed to create the input region");
-        for (r, _) in &hits {
-            if !r.is_empty() {
-                region.add(r.x, r.y, r.w, r.h);
-            }
-        }
-        notif.layer.set_input_region(Some(region.wl_region()));
-
-        notif.layer.wl_surface().damage_buffer(0, 0, w, h);
-        buffer.attach_to(notif.layer.wl_surface()).expect("attach failed");
-        notif.layer.commit();
-
-        self.hits = hits;
     }
 
     fn redraw(&mut self, output: &wl_output::WlOutput) {
         let qh = self.qh.clone();
-        // The bar reserves the current card width for the notification module before it is laid out.
-        let card_w = crate::notify::view::slot_width(self.queue.visible(), &self.theme);
-        self.sections.set_notif_width(card_w);
-        let theme = &self.theme;
-        let text = &mut self.text;
-        let sections = &mut self.sections;
-        if let Some(bar) = self.bars.get_mut(output) {
-            draw_bar(bar, &qh, theme, text, sections);
-        }
+        if let Some(bar) = self.bars.get_mut(output) { draw_bar(bar, &qh, &self.theme, &mut self.text, &mut self.sections); }
     }
 }
 
-/// Draw the whole bar as the left/center/right layout.
 fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme, text: &mut crate::text::TextEngine, sections: &mut crate::bar::Sections) {
-    // No buffer may be attached before the first configure: wlroots treats "a buffer before configure" as a protocol error
-    // (final review Critical #3). The configure callback sets configured = true before reaching here, so this
-    // only stops paths like "the exec module emits before configure → redraw_all".
-    if !bar.configured {
-        return;
-    }
-    let w = bar.width.max(1) as i32;
-    let h = bar.height.max(1) as i32;
+    if !bar.configured { return; }
+    let width = bar.width.max(1) as i32;
+    let height = bar.height.max(1) as i32;
     let widths = sections.widths(text, theme);
-    let l = crate::bar::layout(&widths, w, theme);
-    let (buffer, canvas) = bar.pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).expect("failed to create the buffer");
-    let mut c = crate::canvas::Canvas::new(canvas, w, h);
-    c.clear();
-    c.fill_rounded_rect(crate::geom::Rect::new(0, 0, w, h), theme.radius, theme.background);
-    let rows = [
-        (&l.left[..], &mut sections.left[..]),
-        (&l.center[..], &mut sections.center[..]),
-        (&l.right[..], &mut sections.right[..]),
-    ];
-    // One baseline for the whole bar: all modules share the style, so the cap-height centre is the same.
+    let layout = crate::bar::layout(&widths, width, theme);
+    let (buffer, data) = bar.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888).expect("failed to create the bar buffer");
+    let mut canvas = crate::canvas::Canvas::new(data, width, height);
+    canvas.clear();
+    canvas.fill_rounded_rect(Rect::new(0, 0, width, height), theme.radius, theme.background);
     let top = text.optical_top(&theme.font, 0, theme.height);
+    let rows = [
+        (&layout.left[..], &mut sections.left[..]),
+        (&layout.center[..], &mut sections.center[..]),
+        (&layout.right[..], &mut sections.right[..]),
+    ];
     for (rects, modules) in rows {
-        for (r, m) in rects.iter().zip(modules.iter_mut()) {
-            if r.is_empty() { continue; }
-            let spans = crate::bar::fit_text(&m.spans(), r.w, text, theme);
-            let mut x = r.x;
-            for s in spans {
-                let color = s.color.unwrap_or(theme.foreground);
-                text.draw(&mut c, &s.text, x, top, &theme.font, color);
-                x += text.measure(&s.text, &theme.font).0.ceil() as i32;
+        for (rect, module) in rects.iter().zip(modules.iter_mut()) {
+            if rect.is_empty() { continue; }
+            let spans = crate::bar::fit_text(&module.spans(), rect.w, text, theme);
+            let mut x = rect.x;
+            for span in spans {
+                let color = span.color.unwrap_or(theme.foreground);
+                text.draw(&mut canvas, &span.text, x, top, &theme.font, color);
+                x += text.measure(&span.text, &theme.font).0.ceil() as i32;
             }
         }
     }
-    bar.layer.wl_surface().damage_buffer(0, 0, w, h);
+    bar.layer.wl_surface().damage_buffer(0, 0, width, height);
     buffer.attach_to(bar.layer.wl_surface()).expect("attach failed");
     bar.layer.commit();
 }
 
 impl LayerShellHandler for State {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        // The compositor closing the notification surface (e.g. its output was removed) ≠ process exit.
-        if self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
-            // The compositor closed the notification surface. Recreate it without an explicit output so the
-            // compositor can resolve the current focused-output default again.
-            self.notif = None;
-            self.hits.clear();
-            self.set_anim(None);
-            self.notif_output = None;
-            self.pending_enter = self.queue.visible().first().map(|n| n.id);
-            self.redraw_notifications(Instant::now());
-            return;
-        }
-        // Bar closed → process exit. Only exit when it really matches a bar: when an output is removed we have already
-        // output_destroyed tears down the notification surface itself; a stale closed arriving afterwards belongs to no bar and is ignored.
-        if self.bars.values().any(|b| b.layer.wl_surface() == layer.wl_surface()) {
-            self.exit = true;
-        }
-    }
-
-    fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
-        // The notification surface's configure.
-        if self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
-            if let Some(notif) = self.notif.as_mut() {
-                if let Some(w) = NonZeroU32::new(configure.new_size.0) {
-                    notif.width = w.get();
-                }
-                if let Some(h) = NonZeroU32::new(configure.new_size.1) {
-                    notif.height = h.get();
-                }
-                if !notif.configured {
-                    notif.configured = true;
-                    eprintln!("notif surface configured: {}x{}", notif.width, notif.height);
-                }
-            }
+    fn closed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        let closed_notification = self.notifications.iter().find(|(_, surface)| surface.layer.wl_surface() == layer.wl_surface()).map(|(id, _)| *id);
+        if let Some(id) = closed_notification {
+            self.notifications.remove(&id);
             let now = Instant::now();
+            self.sync_notifications(now);
             self.redraw_notifications(now);
             return;
         }
-        // Bar surface: find the output for that layer surface, then let `redraw` run layout and drawing uniformly
-        let Some(output) = self.bars.iter().find(|(_, b)| b.layer.wl_surface() == layer.wl_surface()).map(|(o, _)| o.clone()) else {
+        if self.bars.values().any(|bar| bar.layer.wl_surface() == layer.wl_surface()) { self.exit = true; }
+    }
+
+    fn configure(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
+        let notification_id = self.notifications.iter().find(|(_, surface)| surface.layer.wl_surface() == layer.wl_surface()).map(|(id, _)| *id);
+        if let Some(id) = notification_id {
+            if let Some(surface) = self.notifications.get_mut(&id) {
+                if let Some(width) = NonZeroU32::new(configure.new_size.0) { surface.width = width.get(); }
+                if let Some(height) = NonZeroU32::new(configure.new_size.1) { surface.height = height.get(); }
+                if !surface.configured {
+                    surface.configured = true;
+                    eprintln!("notif {} configured: {}x{}", id, surface.width, surface.height);
+                }
+            }
+            self.redraw_notifications(Instant::now());
             return;
-        };
+        }
+
+        let Some(output) = self.bars.iter().find(|(_, bar)| bar.layer.wl_surface() == layer.wl_surface()).map(|(output, _)| output.clone()) else { return };
         if let Some(bar) = self.bars.get_mut(&output) {
-            if let Some(w) = NonZeroU32::new(configure.new_size.0) {
-                bar.width = w.get();
-            }
-            if let Some(h) = NonZeroU32::new(configure.new_size.1) {
-                bar.height = h.get();
-            }
+            if let Some(width) = NonZeroU32::new(configure.new_size.0) { bar.width = width.get(); }
+            if let Some(height) = NonZeroU32::new(configure.new_size.1) { bar.height = height.get(); }
             if !bar.configured {
                 bar.configured = true;
                 eprintln!("bar configured: {}x{}", bar.width, bar.height);
             }
         }
         self.redraw(&output);
-        // A notification may arrive before the first output configures (ensure_notif_surface waits for surface_enter then).
-        // One catch-up pass once the bar appears: no-op on an empty queue, otherwise create/draw the surface (final review Important #3).
-        self.redraw_notifications(Instant::now());
     }
 }
 
 impl OutputHandler for State {
     fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
-    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) { self.add_bar(output); }
-    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        if self.notif_output.as_ref() != Some(&output) || self.notif.is_none() {
-            return;
-        }
-        let height = self.notif_surface_height();
-        let needs_resize = self.notif.as_ref().is_some_and(|n| n.height != height);
-        if needs_resize {
-            if let Some(notif) = self.notif.as_mut() {
-                notif.configured = false;
-                notif.width = 0;
-                notif.height = 0;
-                notif.layer.set_size(0, height);
-                notif.layer.commit();
-            }
-        }
-        self.redraw_notifications(Instant::now());
-    }
-    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn new_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) { self.add_bar(output); }
+    fn update_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.bars.remove(&output);
-        // The notification surface's output is gone: do not depend on the order of closed events — tear it down and fall back to
-        // The remaining output. Clear state before redrawing — redraw_notifications is a no-op when the queue is empty.
-        if self.notif_output.as_ref() == Some(&output) {
-            self.notif = None;
-            self.hits.clear();
-            self.set_anim(None);
-            self.notif_output = None;
-            self.pending_enter = self.queue.visible().first().map(|n| n.id);
-            self.redraw_notifications(Instant::now());
-        }
+        let removed: Vec<_> = self.notifications.iter()
+            .filter(|(_, surface)| surface.output.as_ref() == Some(&output))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in removed { self.notifications.remove(&id); }
+        let now = Instant::now();
+        self.sync_notifications(now);
+        self.redraw_notifications(now);
     }
 }
 
 impl SeatHandler for State {
     fn seat_state(&mut self) -> &mut SeatState { &mut self.seat_state }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
-        }
+    fn new_capability(&mut self, _connection: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer && self.pointer.is_none() { self.pointer = self.seat_state.get_pointer(qh, &seat).ok(); }
     }
-    fn remove_capability(&mut self, _conn: &Connection, _: &QueueHandle<Self>, _seat: wl_seat::WlSeat, capability: Capability) {
-        if capability == Capability::Pointer {
-            if let Some(p) = self.pointer.take() { p.release(); }
-        }
+    fn remove_capability(&mut self, _connection: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer && let Some(pointer) = self.pointer.take() { pointer.release(); }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
 impl PointerHandler for State {
-    fn pointer_frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
-        // Only clicks on the notification surface are handled; the bar surface does not respond.
-        let Some(notif_surface) = self.notif.as_ref().map(|n| n.layer.wl_surface().clone()) else { return };
-        let mut closed: Option<u32> = None;
-        for ev in events {
-            if &ev.surface != &notif_surface {
-                continue;
-            }
-            let PointerEventKind::Press { button, .. } = ev.kind else { continue };
-            let x = ev.position.0 as i32;
-            let y = ev.position.1 as i32;
-            match crate::notify::view::hit(&self.hits, x, y) {
-                // The button wins: a left click triggers the action and closes.
-                Some(Action::NotificationAction { id, key }) => {
-                    if button == BTN_LEFT {
-                        if let Some(c) = &self.dbus {
-                            let _ = crate::notify::service::emit_action(c, id, &key);
-                        }
-                        closed = Some(id);
-                    }
+    fn pointer_frame(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        let mut closed = None;
+        for event in events {
+            let Some((_, surface)) = self.notifications.iter().find(|(_, surface)| surface.layer.wl_surface() == &event.surface) else { continue };
+            let PointerEventKind::Press { button, .. } = event.kind else { continue };
+            match crate::notify::view::hit(&surface.hits, event.position.0 as i32, event.position.1 as i32) {
+                Some(Action::NotificationAction { id, key }) if button == BTN_LEFT => {
+                    if let Some(connection) = &self.dbus { let _ = crate::notify::service::emit_action(connection, id, &key); }
+                    closed = Some(id);
                 }
-                // Card body: left/middle click closes.
-                Some(Action::NotificationClose(id)) => {
-                    if button == BTN_LEFT || button == BTN_MIDDLE {
-                        closed = Some(id);
-                    }
-                }
-                None => {}
+                Some(Action::NotificationClose(id)) if button == BTN_LEFT || button == BTN_MIDDLE => closed = Some(id),
+                _ => {}
             }
         }
         if let Some(id) = closed {
             let now = Instant::now();
-            self.close_visible(id, 2, now);
-            self.redraw_notifications(now);
+            if self.remove_notification(id, 2) {
+                self.sync_notifications(now);
+                self.redraw_notifications(now);
+            }
         }
     }
 }
 
-// No frame callback is needed: redraws are driven by a calloop timer and a callback would add no extra cadence information.
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, output: &wl_output::WlOutput) {
-        if !self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == surface) || self.notif_output.as_ref() == Some(output) {
-            return;
-        }
-        self.notif_output = Some(output.clone());
-        let height = self.notif_surface_height();
-        if let Some(notif) = self.notif.as_mut() {
-            notif.configured = false;
-            notif.width = 0;
-            notif.height = 0;
-            notif.layer.set_size(0, height);
-            notif.layer.commit();
-        }
-        let now = Instant::now();
-        if let Some(id) = self.pending_enter.take() {
-            self.start_enter(id, now);
-        }
-        self.redraw_notifications(now);
+        let Some((_, notification)) = self.notifications.iter_mut().find(|(_, notification)| notification.layer.wl_surface() == surface) else { return };
+        if notification.output.as_ref() != Some(output) { notification.output = Some(output.clone()); }
     }
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -829,29 +542,26 @@ smithay_client_toolkit::delegate_dispatch2!(State);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn animating_asks_for_next_frame() {
-        let t = Instant::now();
-        assert_eq!(next_deadline(t, true, None), t + FRAME_INTERVAL);
+        let now = Instant::now();
+        assert_eq!(next_deadline(now, true, None), now + FRAME_INTERVAL);
     }
 
     #[test]
     fn idle_waits_for_the_clock_tick() {
-        let t = Instant::now();
-        assert_eq!(next_deadline(t, false, None), t + CLOCK_INTERVAL);
+        let now = Instant::now();
+        assert_eq!(next_deadline(now, false, None), now + CLOCK_INTERVAL);
     }
 
     #[test]
-    fn earliest_deadline_wins() {
-        let t = Instant::now();
-        // Expiry earlier than the next frame → use the expiry
-        let soon = t + Duration::from_millis(5);
-        assert_eq!(next_deadline(t, true, Some(soon)), soon);
-        let later = t + Duration::from_secs(30);
-        assert_eq!(next_deadline(t, true, Some(later)), t + FRAME_INTERVAL);
-        // and an expired time is never returned as a past instant either
-        assert_eq!(next_deadline(t, false, Some(t - Duration::from_secs(1))), t);
+    fn earliest_deadline_wins_and_never_returns_the_past() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(5);
+        let later = now + Duration::from_secs(30);
+        assert_eq!(next_deadline(now, true, Some(soon)), soon);
+        assert_eq!(next_deadline(now, false, Some(later)), now + CLOCK_INTERVAL);
+        assert_eq!(next_deadline(now, false, Some(now - Duration::from_secs(1))), now);
     }
 }

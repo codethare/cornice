@@ -10,7 +10,7 @@ use crate::geom::Color;
 use crate::theme::{parse_font, Theme};
 
 #[derive(Clone)]
-pub struct Config { pub bar: Bar, pub theme: Theme, pub notification: Notification }
+pub struct Config { pub bar: Bar, pub theme: Theme, pub notification: Option<Notification> }
 
 /// Hand-written `Debug`: the embedded `Theme` holds a `TextStyle`, which does not derive `Debug`
 /// (it belongs to Task 3's file range), the derivation comes along with it. The planned test wants `unwrap_err()`,
@@ -38,18 +38,19 @@ pub struct Bar {
 pub enum ModuleSpec {
     Clock { #[serde(default = "default_clock_format")] format: String },
     Exec { command: String, #[serde(default)] format: String },
-    /// The notification daemon's cards: the module marks where the bar's material stretches downwards.
-    Notification,
 }
 
 fn default_clock_format() -> String { "%H:%M".to_string() }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationPosition { Left, Center, Right }
+
 #[derive(Clone, Debug)]
-pub struct Notification { pub max_visible: usize, pub enter_ms: u64, pub exit_ms: u64 }
+pub struct Notification { pub position: NotificationPosition, pub max_visible: usize, pub enter_ms: u64, pub exit_ms: u64 }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct RawConfig { bar: RawBar, theme: RawTheme, notification: RawNotification }
+struct RawConfig { bar: RawBar, theme: RawTheme, notification: Option<RawNotification> }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -76,10 +77,10 @@ struct RawTheme {
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawNotification { max_visible: usize, enter_ms: u64, exit_ms: u64 }
+struct RawNotification { position: Option<Spanned<String>>, max_visible: usize, enter_ms: u64, exit_ms: u64 }
 
 impl Default for RawNotification {
-    fn default() -> Self { Self { max_visible: 4, enter_ms: 220, exit_ms: 160 } }
+    fn default() -> Self { Self { position: None, max_visible: 4, enter_ms: 220, exit_ms: 160 } }
 }
 
 /// Byte offset → (line, col), 1-based.
@@ -117,26 +118,21 @@ fn height_at(text: &str, v: &Option<Spanned<i32>>) -> Result<i32, String> {
 
 fn modules_of(spanned: &[Spanned<ModuleSpec>]) -> Vec<ModuleSpec> { spanned.iter().map(|m| m.get_ref().clone()).collect() }
 
-/// One stretch can only hang off one place, so the module may be configured once.
-fn no_duplicate_notification(text: &str, sections: [&[Spanned<ModuleSpec>]; 3]) -> Result<(), String> {
-    let mut seen = false;
-    for s in sections {
-        for m in s {
-            if matches!(m.get_ref(), ModuleSpec::Notification) {
-                if seen {
-                    let (l, c) = line_col(text, m.span().start);
-                    return Err(format!("{l}:{c}: notification: the notification module may be configured only once"));
-                }
-                seen = true;
-            }
+fn notification_position_at(text: &str, value: &Option<Spanned<String>>) -> Result<NotificationPosition, String> {
+    let Some(value) = value else { return Ok(NotificationPosition::Right) };
+    match value.get_ref().as_str() {
+        "left" => Ok(NotificationPosition::Left),
+        "center" => Ok(NotificationPosition::Center),
+        "right" => Ok(NotificationPosition::Right),
+        _ => {
+            let (line, column) = line_col(text, value.span().start);
+            Err(format!("{line}:{column}: notification.position: expected left, center, or right"))
         }
     }
-    Ok(())
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("{e}"))?;
-    no_duplicate_notification(text, [&raw.bar.left.modules, &raw.bar.center.modules, &raw.bar.right.modules])?;
 
     let height = height_at(text, &raw.bar.height)?;
     let mut theme = Theme::defaults(height);
@@ -149,6 +145,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(f) = &raw.theme.font {
         theme.font = parse_font(f.get_ref(), theme.font.size);
     }
+    let notification = match raw.notification {
+        Some(notification) => Some(Notification {
+            position: notification_position_at(text, &notification.position)?,
+            max_visible: notification.max_visible.max(1),
+            enter_ms: notification.enter_ms,
+            exit_ms: notification.exit_ms,
+        }),
+        None => None,
+    };
 
     Ok(Config {
         bar: Bar {
@@ -159,11 +164,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             right: modules_of(&raw.bar.right.modules),
         },
         theme,
-        notification: Notification {
-            max_visible: raw.notification.max_visible.max(1),
-            enter_ms: raw.notification.enter_ms,
-            exit_ms: raw.notification.exit_ms,
-        },
+        notification,
     })
 }
 
@@ -215,6 +216,7 @@ modules = []
 modules = [ { kind = "exec", command = "echo hi", format = "{out}!" } ]
 
 [notification]
+position = "left"
 max_visible = 3
 "##;
 
@@ -231,8 +233,10 @@ max_visible = 3
         assert_eq!(c.theme.background.a, 0xee);
         assert_eq!(c.theme.font.size, 11.0);
         assert_eq!(c.theme.font.family, "Inter");
-        assert_eq!(c.notification.max_visible, 3);
-        assert_eq!(c.notification.enter_ms, 220, "the default when absent");
+        let notification = c.notification.as_ref().expect("[notification] enables cards");
+        assert_eq!(notification.position, NotificationPosition::Left);
+        assert_eq!(notification.max_visible, 3);
+        assert_eq!(notification.enter_ms, 220, "the default when absent");
     }
 
     /// The shipped template is a document, not decoration: it must stay parseable.
@@ -241,20 +245,35 @@ max_visible = 3
         let c = parse(include_str!("../config.toml")).unwrap();
         assert_eq!(c.bar.height, 30);
         assert_eq!(c.bar.margin, 0);
-        assert_eq!(c.bar.right.len(), 3);
-        assert_eq!(c.bar.right[2], ModuleSpec::Notification);
+        assert_eq!(c.bar.right.len(), 2);
         assert_eq!(c.theme.radius, 15);
-        assert_eq!(c.notification.max_visible, 4);
+        let notification = c.notification.as_ref().expect("the template enables notifications");
+        assert_eq!(notification.position, NotificationPosition::Right);
+        assert_eq!(notification.max_visible, 4);
     }
 
-    /// The stretch can only hang off one module, so a second `notification` entry is a config error that
-    /// points at it — not a silently ignored duplicate.
     #[test]
-    fn the_notification_module_is_allowed_once() {
-        let c = parse("[bar.right]\nmodules = [ { kind = \"notification\" } ]\n").unwrap();
-        assert_eq!(c.bar.right, vec![ModuleSpec::Notification]);
-        let e = parse("[bar.left]\nmodules = [ { kind = \"notification\" } ]\n\n[bar.right]\nmodules = [ { kind = \"notification\" } ]\n").unwrap_err();
-        assert!(e.starts_with("5:"), "the error points at the second entry: {e}");
+    fn notification_section_is_optional_and_defaults_to_right() {
+        assert!(parse("").unwrap().notification.is_none());
+        let c = parse("[notification]\n").unwrap();
+        assert_eq!(c.notification.unwrap().position, NotificationPosition::Right);
+    }
+
+    #[test]
+    fn notification_position_accepts_only_three_anchors() {
+        for (position, expected) in [("left", NotificationPosition::Left), ("center", NotificationPosition::Center), ("right", NotificationPosition::Right)] {
+            let c = parse(&format!("[notification]\nposition = {position:?}\n")).unwrap();
+            assert_eq!(c.notification.unwrap().position, expected);
+        }
+        let error = parse("[notification]\nposition = \"middle\"\n").unwrap_err();
+        assert!(error.starts_with("2:"), "the invalid position points at its line:column: {error}");
+        assert!(error.contains("notification.position"), "{error}");
+    }
+
+    #[test]
+    fn notification_is_not_a_bar_module() {
+        let error = parse("[bar.right]\nmodules = [ { kind = \"notification\" } ]\n").unwrap_err();
+        assert!(error.contains("notification") || error.contains("unknown variant"), "{error}");
     }
 
     #[test]

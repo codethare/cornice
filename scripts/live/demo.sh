@@ -59,8 +59,7 @@ fi
 
 rm -rf "$W/run" "$W/cfg"; mkdir -p "$W/run" "$W/cfg/cornice"; chmod 700 "$W/run"
 cat > "$W/cfg/cornice/config.toml" <<'EOF'
-# The demo config: a slightly slower enter animation than the 220 ms default, so the stretch out of the
-# bar survives being sampled at ~14 fps.
+# The demo config uses a slower enter so each independent card can be sampled clearly.
 [bar]
 height   = 30
 margin   = 0
@@ -74,9 +73,10 @@ accent     = "#88c0d0"
 radius     = 15
 
 [notification]
+position = "right"
 max_visible = 4
-enter_ms    = 1200
-exit_ms     = 450
+enter_ms = 1200
+exit_ms = 450
 
 [bar.left]
 modules = [ { kind = "clock", format = "%H:%M" } ]
@@ -85,7 +85,7 @@ modules = [ { kind = "clock", format = "%H:%M" } ]
 modules = [ { kind = "exec", command = "echo cornice", format = "{out}" } ]
 
 [bar.right]
-modules = [ { kind = "exec", command = "echo 87%", format = "{out}" }, { kind = "notification" } ]
+modules = [ { kind = "exec", command = "echo 87%", format = "{out}" } ]
 EOF
 export XDG_RUNTIME_DIR=$W/run
 export WAYLAND_DISPLAY=wayland-1
@@ -164,8 +164,8 @@ vp at $curx $cury
 record_start
 sleep 0.8
 
-glide 1200 22 6                                   # up to the bar's right cluster
-notify demo 0 "" "cornice" "44 checks passed" "[]" "{}" 0
+glide 1200 22 6                                   # up to the top-right notification anchor
+notify demo 0 "" "cornice" "independent cards" "[]" "{}" 0
 sleep 1.8
 notify demo 0 "" "battery" "87% - 3h 20m left" "['open', 'Open']" "{}" 0
 sleep 1.8

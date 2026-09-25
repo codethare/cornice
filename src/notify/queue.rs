@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Urgency { Low, Normal, Critical }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
     pub id: u32,
     pub app_name: String,
@@ -70,9 +70,7 @@ impl Queue {
     }
 
     pub fn visible(&self) -> &[Notification] { &self.items[..self.items.len().min(self.max_visible)] }
-    pub fn len(&self) -> usize { self.items.len() }
     pub fn get(&self, id: u32) -> Option<&Notification> { self.items.iter().find(|n| n.id == id) }
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
 
     pub fn remove(&mut self, id: u32) -> Option<Notification> {
         let i = self.items.iter().position(|n| n.id == id)?;

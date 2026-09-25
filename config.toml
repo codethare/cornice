@@ -31,10 +31,9 @@ accent     = "#88c0d0"      # accent colour (critical notifications etc.), defau
 font       = "monospace 11" # default monospace 11
 # Corner radius in pixels. Absent = height/2, i.e. a capsule.
 radius     = 15             # default height/2
-# Note: the card gap (default height/5) and card padding (default height/2) can only be derived from height and are not configurable.
-# Text is placed by cap height (not by line box), so card_padding measures the visible whitespace:
-# the top of the first card line sits exactly one card_padding below the card's top edge, and the last line's baseline the same distance above the bottom edge.
-# The first card sits against the bar's bottom edge (no card_gap): it is the one stretching out of the bar, joined by the rounded shoulder tangent to the bar's bottom edge.
+# Notification spacing, padding, width, radius and minimum height are derived from height and are not configurable.
+# Text is placed by cap height. Each independent card keeps a fixed width; body/action rows grow its height,
+# and the first card starts one card_gap below the bar.
 
 # Each of the three areas is an ordered module list: reorder it to reorder them, delete an entry to switch it off.
 # No nested containers, no layout language — that is the whole meaning of "freedom to combine".
@@ -59,21 +58,16 @@ modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
   # 1-minute load average:
   { kind = "exec", command = "while true; do awk '{print int($1)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
-  # The notification daemon's cards. The module marks where the bar's material stretches: the first card is
-  # shown inside the bar, and a long body (or a second card) stretches the same background further down, never
-  # separating from the bar. It may be configured once, in any of the three sections.
-  { kind = "notification" },
 ]
 
 [notification]
-# Behaviour of the built-in notification daemon (the cards notify-send pops up). The cards are drawn at the
-# place where a `notification` module sits (see [bar.right] above); without that module nothing is drawn.
-# The card's size is derived from the bar height, not configurable: width = 10 × height and corner radius =
-# 1.2 × height (Apple's expanded Live Activity: 371 pt wide and a 44 pt radius on a 36.67 pt island), so every
-# card in the stack is the same size and the bar reserves one width while anything is showing.
-# How many cards are drawn at once; the rest stay queued undrawn. Default 4. Minimum 1.
+# Presence of this section enables desktop notification cards below the bar. Without it the D-Bus daemon
+# still runs, but no card surface is created.
+# Horizontal anchor for the whole vertical card column. Default: right.
+position = "right" # left | center | right
+# How many cards are shown independently at once; the rest stay queued. Default 4. Minimum 1.
 max_visible = 4
-# Stretch duration of the column below the bar, in milliseconds, default 220.
-enter_ms    = 220
-# Retract duration, in milliseconds, default 160.
-exit_ms     = 160
+# Enter duration in milliseconds, default 220.
+enter_ms = 220
+# Exit duration in milliseconds, default 160.
+exit_ms  = 160

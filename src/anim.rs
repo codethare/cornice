@@ -1,4 +1,4 @@
-//! Easing and tweening. There is exactly one animation (the notification stretch entering and leaving), so there is no general keyframe system.
+//! Easing and tweening. Notification cards can have independent motions, so this is a small reusable value type rather than a global animation owner.
 
 use std::time::{Duration, Instant};
 

@@ -6,14 +6,10 @@ use crate::text::TextStyle;
 /// Card width bounds; the derived width is a multiple of the bar height in between.
 pub const MIN_CARD_W: i32 = 80;
 pub const MAX_CARD_W: i32 = 420;
-/// Card width as a multiple of the bar height: Apple's expanded Live Activity is 371 pt wide on a 36.67 pt island,
-/// i.e. ~10× the compact height, and it is a *fixed* size rather than a shrink-wrap of its content, so every card
-/// in a stack is the same width and the bar reserves one width (HIG Live Activities, iOS dimensions).
+/// Apple does not publish macOS notification-banner dimensions. Keep cornice's existing 10× internal ratio;
+/// a fixed width gives every card in the vertical column the same optical span.
 const CARD_W_PER_HEIGHT: i32 = 10;
-/// Card corner radius as a multiple of the bar height: the Dynamic Island uses a 44 pt radius on that same
-/// 36.67 pt island — 1.2× its height. That is far more than half the expanded height would allow as a capsule, so
-/// the expanded shape reads as one soft block (HIG Live Activities: "the Dynamic Island uses a corner radius of
-/// 44 points").
+/// A soft, continuous-cornered desktop banner rather than a bar-height capsule.
 const CARD_RADIUS_PER_HEIGHT: f32 = 1.2;
 
 #[derive(Clone)]
@@ -41,6 +37,12 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// A short desktop banner still needs enough vertical room for one balanced line.
+    pub fn card_min_h(&self) -> i32 {
+        let line = (self.font.size * 1.35).ceil() as i32;
+        (self.height * 5 / 2).max(line + self.card_padding * 2)
+    }
+
     pub fn defaults(height: i32) -> Self {
         let foreground = Color::rgba(0xdc, 0xdc, 0xdc, 0xff);
         Self {
@@ -96,6 +98,7 @@ mod tests {
         // Apple's ratios: the expanded Live Activity is 10× the island height wide and 1.2× it round.
         assert_eq!(t.card_w, 300);
         assert_eq!(t.card_radius, 36);
+        assert_eq!(t.card_min_h(), 75);
         assert!(t.secondary.a < t.foreground.a, "the body is the secondary label, not the primary one");
         // The derived values stay inside their bounds on a tall bar, and stay usable on a short one.
         assert_eq!(Theme::defaults(120).card_w, MAX_CARD_W);
