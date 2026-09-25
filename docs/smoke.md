@@ -106,14 +106,14 @@ errors with line numbers, and the two-output behaviour.
       (the harness drives the same D-Bus API with `gdbus`; `notify-send` itself is not installed here)
 - [ ] *(human)* `powertop`/`perf stat`: no sustained 60fps wakeups (the harness measures CPU time as a proxy: < 50 ticks
       per 5 idle seconds)
-- [ ] *(human)* Multi-monitor with a real second output: the bar appears on both, notifications on one
+- [ ] *(human)* Multi-monitor with a real second output: focus output B, send a notification, and confirm the
+      notification surface appears on B; this checks the compositor's focused-output layer-shell default
 
 ### Known compromises (read first)
 
-- **Multi-monitor**: notifications are pinned to one output — the one `ensure_notif_surface` happens to pick from
-  `bars.keys().next()`, i.e. **HashMap order**, not "the first output" in any stable sense (measured: output 2 in
-  one run, output 1 in the next).
-  layer-shell client surfaces are **non-interactive** (keyboard focus is invisible), so there is no way to know which
-  output currently has focus — hence design doc §7's "deliver to the focused output" cannot be implemented.
-  Upgrade path: create one notification surface per output and show the same queue on each.
+- **Multi-monitor**: the notification surface is created with `output = null`; on river + tailrace the compositor
+  resolves that to the focused output's layer-shell default, and `surface_enter` records the actual output for layout.
+  The choice is made when the surface is created; an already mapped surface does not migrate automatically if focus
+  changes later. Live migration would require a WM-provided focus-change signal, which is outside this client-only
+  scope.
 - **Target-environment gap**: passing section 3 on sway does not mean passing on river + tailrace (river's layer-shell is forwarded by the WM).

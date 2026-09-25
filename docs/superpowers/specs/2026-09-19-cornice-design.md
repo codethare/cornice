@@ -1,7 +1,7 @@
 # cornice 设计文档
 
 日期:2026-09-19(v2 — v1 的 `river.*` 模块已删除,理由见 §2)
-状态:已确认(v4 — 在 Apple HIG 信息层级上补充内容节奏;代码已实施,像素待 smoke)
+状态:已确认(v5 — 通知 surface 使用焦点 output 的 layer-shell default;代码已实施,像素待 smoke)
 
 ## 1. 目标
 
@@ -31,6 +31,7 @@
 
 - 目标运行时是 **river(最新,≥0.4.6)+ tailrace**(<https://github.com/codethare/tailrace>),不是 kwm。
 - tailrace **实现了 `river-layer-shell-v1`**:vendored `protocol/river-layer-shell-v1.xml`,`src/seat.rs` 处理 exclusive / non-exclusive layer-shell 焦点。
+- tailrace 在焦点 output 上调用 `river_layer_shell_output_v1.set_default`;因此普通 `wlr-layer-shell` 客户端把 output 传 `null` 时,合成器会把新 surface 放到当前焦点 output。cornice 不绑定任何 `river.*` 协议,只使用这个标准 layer-shell 的默认行为。
 - tailrace 源码中**没有任何 wl_shm 或渲染代码** —— 层壳 surface 由 **river 自己合成**,WM 只负责焦点与策略。
 - 结论:cornice 作为普通 `wlr-layer-shell` 客户端,在 river + tailrace 上可正常出图,不依赖 WM 的渲染能力。
 
@@ -41,11 +42,11 @@ v1 的 spec 里计划了 `river.tags` / `river.title` / `river.layout` / `river.
 1. river 的 `protocol/` 目录只有:`river-input-management-v1`、`river-layer-shell-v1`、`river-libinput-config-v1`、`river-touch-gestures-v1`、`river-window-management-v1`、`river-xkb-bindings-v1`、`river-xkb-config-v1`。
 2. waybar 的 `river/tags` 在新 river 上直接报 `river_status_manager_v1 not advertised`。
 3. `ext-workspace-v1` 是尚未实现的 feature request(river#1402,2026-03 开)。
-4. tailrace 的 `protocol/` 里同样没有状态协议,也不发布任何 workspace 状态。
+4. tailrace 的 `protocol/` 里没有面向普通客户端的 workspace/focus 状态流;它只通过 layer-shell default 把新通知 surface 路由到当前焦点 output。
 5. `river-window-management-v1` 按协议规定只发给 WM 一个客户端,bar 拿不到 tags。
 6. river 支持 `ext-foreign-toplevel-list-v1`(0.3.13 起),但只提供 title / app_id,**没有 focus 信息**。
 
-即:**在现代 river 上,tags / 当前窗口标题结构上无法被第三方 bar 获取。** 未来的路只有两条,都不在本项目范围内:上游 river 实现 `ext-workspace-v1`,或 tailrace 自己发布一个状态协议。
+即:**在现代 river 上,tags / 当前窗口标题结构上无法被第三方 bar 获取。** 通知的 output 选择可借助 layer-shell default,但已映射 surface 的实时焦点迁移仍需要 WM 信号;上游 river 实现 `ext-workspace-v1` 或 tailrace 发布状态协议仍不在本项目范围内。
 
 来源:
 - <https://codeberg.org/river/river> (protocol/ 目录、README)
@@ -70,14 +71,14 @@ D-Bus 线程 (zbus blocking, org.freedesktop.Notifications)
 ```
 
 - D-Bus 在独立线程使用 zbus 的 **blocking** API(它自带执行器线程),接口方法把请求结构体通过 `calloop::channel::Sender` 投给主循环。**主循环内没有 async,状态集中在单线程**,动画与通知队列无需加锁。
-- 每个 output 拥有一套(栏 surface + 通知 surface),同进程内多实例共存。
+- 每个 output 拥有一套栏 surface;通知 surface 单独创建一个,使用 `output = null` 让 river + tailrace 选择焦点 output。
 
 ### Surface
 
 | surface | layer | anchor | 生命周期 |
 |---|---|---|---|
 | 栏 | `Top` | top + left + right | 常驻,每 output 一个,`exclusive_zone = 栏高 + 2×margin` |
-| 通知 | `Overlay` | top + left + right,`margin_top = bar.margin` | 队列非空时创建,清空后销毁 |
+| 通知 | `Overlay` | top + left + right,`margin_top = bar.margin` | 队列非空时创建一个无显式 output 的 surface,清空后销毁 |
 
 通知 surface 是全宽透明大块(高度 = 栏高 + 最大卡片区),所有卡片绘制在同一个 buffer 内。每帧调用 `set_input_region` 设为其可见形状的并集,因此透明区域对指针完全穿透。它铺在栏之上(`Overlay` > `Top`),这是拉伸成立的前提:列的 y=0 与栏的 y=0 是同一条线,列与栏重叠的部分不画底色。
 
@@ -252,7 +253,7 @@ t=1   rect = 整叠(顶到栏顶,底到窥视条的底边)
 
 **surface 高度**:`max_tail` = 最坏的首卡 + `card_gap` + 一条窥视条,再**封顶在 output 高度的 1/4**(`view::MAX_TAIL_PERCENT`)。`bar.height` 是 1..=256 的配置项,在矮屏上必须由屏幕而不是栏来决定叠能借多少;封顶之后超出的部分被 surface 裁掉。output 高度取 `zxdg_output_v1` 的 logical size,退化时取当前 mode。surface 只创建一次、尺寸不变 —— 逐帧 resize 要过一趟 configure,动画会抖。
 
-**多显示器**:通知投给当前 focus 的 output,使用该 output 的栏矩形。
+**多显示器**:通知 surface 创建时不指定 output,由 river + tailrace 将它解析到当前焦点 output;`wl_surface.enter` 记录实际 output,再按该 output 的逻辑高度请求 surface size,并使用对应栏的槽位。默认 output 只在 surface 创建时选择,已经映射的 surface 不会因之后焦点变化而自动迁移;若需要实时迁移,必须由 WM 暴露焦点变化信号。
 
 ## 8. 文件划分
 

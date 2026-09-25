@@ -117,8 +117,10 @@ pub struct State {
     pub hits: Vec<(Rect, Action)>,
     /// the in-flight enter/leave animation; at most one at a time. An internal detail; the type is not exposed.
     anim: Option<Anim>,
-    /// The output the notification surface hangs on (the first output that has a bar).
+    /// The output the compositor selected for the output-less notification surface; set by `surface_enter`.
     notif_output: Option<wl_output::WlOutput>,
+    /// An enter animation waiting for the compositor to resolve the notification surface's default output.
+    pending_enter: Option<u32>,
     /// Registration handle for the frame source: inserted while animating, set to None after it self-Drops when idle.
     frame_id: Option<RegistrationToken>,
     /// Event-loop handle so `set_anim` can insert the frame source from any callback.
@@ -175,6 +177,7 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         hits: Vec::new(),
         anim: None,
         notif_output: None,
+        pending_enter: None,
         frame_id: None,
         loop_handle: handle.clone(),
     };
@@ -310,14 +313,15 @@ impl State {
         }
     }
 
-    /// The output the notification surface targets: the one it was created on, else the first that has a bar.
+    /// The output selected by the compositor for the notification surface. An output-less layer surface is
+    /// deliberately used so river + tailrace can route it to the focused output's layer-shell default.
     fn notif_target(&self) -> Option<wl_output::WlOutput> {
-        self.notif_output.clone().or_else(|| self.bars.keys().next().cloned())
+        self.notif_output.clone()
     }
 
     /// The bar width (full width) of the output the notification surface should target.
     fn notif_output_width(&self) -> Option<i32> {
-        self.notif_target().and_then(|o| self.bars.get(&o)).map(|b| (b.width.max(1)) as i32)
+        self.notif_target().and_then(|o| self.bars.get(&o)).and_then(|b| (b.width > 0).then_some(b.width as i32))
     }
 
     /// The output's logical height — the budget the notification stack borrows before it is capped.
@@ -328,8 +332,8 @@ impl State {
     }
 
     /// Notification surface height: the bar plus the worst-case tail of one card and one peek pill, capped by
-    /// the output (see `view::max_tail`). It is sized once — a resize per animation frame goes through a
-    /// configure round-trip and would stutter the stretch.
+    /// the output when the compositor has selected it (see `view::max_tail`). Before `surface_enter`, this is
+    /// an uncapped pool bound; the real layer size is requested once the output is known.
     fn notif_surface_height(&mut self) -> u32 {
         let output_h = self.notif_output_height();
         let tail = crate::notify::view::max_tail(&self.theme, &mut self.text, output_h);
@@ -357,20 +361,20 @@ impl State {
     /// Make sure the notification surface exists while the queue is non-empty or a leave animation is running.
     fn ensure_notif_surface(&mut self) {
         if self.notif.is_some() { return; }
-        let Some(output) = self.notif_output.clone().or_else(|| self.bars.keys().next().cloned()) else { return };
-        self.notif_output = Some(output.clone());
         let qh = self.qh.clone();
         let surface = self.compositor.create_surface(&qh);
-        let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(LAYER_NAMESPACE), Some(&output));
+        // No output: river + tailrace resolves this to the focused output's layer-shell default. The
+        // compositor reports the choice through wl_surface.enter, after which the real size is requested.
+        let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(LAYER_NAMESPACE), None);
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
         layer.set_margin(self.cfg.bar.margin, 0, 0, 0);
         layer.set_exclusive_zone(-1); // takes no space
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        let height = self.notif_surface_height();
-        layer.set_size(0, height);
+        let pool_height = self.notif_surface_height(); // uncapped until surface_enter supplies an output
+        layer.set_size(0, 1); // wait for the selected output before requesting the real height
         layer.commit();
-        let pool = SlotPool::new((height as usize) * 4096 * 4, &self.shm).expect("failed to create the notification shm pool");
-        self.notif = Some(NotifSurface { layer, pool, width: 0, height, configured: false });
+        let pool = SlotPool::new((pool_height as usize) * 4096 * 4, &self.shm).expect("failed to create the notification shm pool");
+        self.notif = Some(NotifSurface { layer, pool, width: 0, height: 1, configured: false });
     }
 
     /// Destroy the notification surface. sctk 0.21's LayerSurface has no destroy(); its Drop destroys the proxy.
@@ -382,7 +386,15 @@ impl State {
 
     /// Start the enter animation (the id must be the one just inserted at the head).
     fn start_enter(&mut self, id: u32, now: Instant) {
-        let Some(output_w) = self.notif_output_width() else { return };
+        if !self.queue.visible().first().is_some_and(|n| n.id == id) {
+            self.pending_enter = None;
+            return;
+        }
+        let Some(output_w) = self.notif_output_width() else {
+            self.pending_enter = Some(id);
+            return;
+        };
+        self.pending_enter = None;
         let Some(stack) = self.notif_stack(output_w) else { return };
         // Apple's island opens onto the bar and stays open: a notification arriving while it is open *extends* it
         // (`Update a Live Activity only when new content is available`), so the tween starts from the shape that is
@@ -477,6 +489,7 @@ impl State {
         // 3. Queue empty and no leave animation → destroy the surface; the bar takes its space back.
         let exit_in_flight = matches!(&self.anim, Some(a) if matches!(a.kind, AnimKind::Exit));
         if self.queue.is_empty() && !exit_in_flight {
+            self.pending_enter = None;
             if self.notif.is_some() {
                 self.destroy_notif_surface();
             }
@@ -490,6 +503,11 @@ impl State {
         // 4. Make sure the surface exists.
         self.ensure_notif_surface();
         let Some(output_w) = self.notif_output_width() else { return };
+        if self.anim.is_none() {
+            if let Some(id) = self.pending_enter.take() {
+                self.start_enter(id, now);
+            }
+        }
 
         // 5. Geometry (independent of whether the surface is configured; uses the bar width).
         let Some(stack) = self.notif_stack(output_w) else { return };
@@ -518,7 +536,7 @@ impl State {
 
         // 6. Draw.
         let Some(notif) = self.notif.as_mut() else { return };
-        if notif.width == 0 {
+        if !notif.configured || notif.width == 0 {
             return; // wait for the configure callback
         }
         let w = notif.width as i32;
@@ -619,13 +637,13 @@ impl LayerShellHandler for State {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
         // The compositor closing the notification surface (e.g. its output was removed) ≠ process exit.
         if self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
-            // The compositor closed the notification surface (usually because its output was removed).
-            // Clear the state before redrawing: ensure_notif_surface falls back to a remaining output when the queue is non-empty,
-            // otherwise a resident notification with expire=None would stay invisible forever.
+            // The compositor closed the notification surface. Recreate it without an explicit output so the
+            // compositor can resolve the current focused-output default again.
             self.notif = None;
             self.hits.clear();
             self.set_anim(None);
             self.notif_output = None;
+            self.pending_enter = self.queue.visible().first().map(|n| n.id);
             self.redraw_notifications(Instant::now());
             return;
         }
@@ -672,7 +690,7 @@ impl LayerShellHandler for State {
             }
         }
         self.redraw(&output);
-        // A notification may arrive before the first output configures (ensure_notif_surface was a no-op then).
+        // A notification may arrive before the first output configures (ensure_notif_surface waits for surface_enter then).
         // One catch-up pass once the bar appears: no-op on an empty queue, otherwise create/draw the surface (final review Important #3).
         self.redraw_notifications(Instant::now());
     }
@@ -681,7 +699,23 @@ impl LayerShellHandler for State {
 impl OutputHandler for State {
     fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
     fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) { self.add_bar(output); }
-    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
+    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if self.notif_output.as_ref() != Some(&output) || self.notif.is_none() {
+            return;
+        }
+        let height = self.notif_surface_height();
+        let needs_resize = self.notif.as_ref().is_some_and(|n| n.height != height);
+        if needs_resize {
+            if let Some(notif) = self.notif.as_mut() {
+                notif.configured = false;
+                notif.width = 0;
+                notif.height = 0;
+                notif.layer.set_size(0, height);
+                notif.layer.commit();
+            }
+        }
+        self.redraw_notifications(Instant::now());
+    }
     fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.bars.remove(&output);
         // The notification surface's output is gone: do not depend on the order of closed events — tear it down and fall back to
@@ -691,6 +725,7 @@ impl OutputHandler for State {
             self.hits.clear();
             self.set_anim(None);
             self.notif_output = None;
+            self.pending_enter = self.queue.visible().first().map(|n| n.id);
             self.redraw_notifications(Instant::now());
         }
     }
@@ -756,7 +791,25 @@ impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, output: &wl_output::WlOutput) {
+        if !self.notif.as_ref().is_some_and(|n| n.layer.wl_surface() == surface) || self.notif_output.as_ref() == Some(output) {
+            return;
+        }
+        self.notif_output = Some(output.clone());
+        let height = self.notif_surface_height();
+        if let Some(notif) = self.notif.as_mut() {
+            notif.configured = false;
+            notif.width = 0;
+            notif.height = 0;
+            notif.layer.set_size(0, height);
+            notif.layer.commit();
+        }
+        let now = Instant::now();
+        if let Some(id) = self.pending_enter.take() {
+            self.start_enter(id, now);
+        }
+        self.redraw_notifications(now);
+    }
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
 
