@@ -396,7 +396,7 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
     let (buffer, data) = bar.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888).expect("failed to create the bar buffer");
     let mut canvas = crate::canvas::Canvas::new(data, width, height);
     canvas.clear();
-    canvas.fill_rounded_rect(Rect::new(0, 0, width, height), theme.radius, theme.background);
+    canvas.fill_rect(Rect::new(0, 0, width, height), theme.background);
     let top = text.optical_top(&theme.font, 0, theme.height);
     let rows = [
         (&layout.left[..], &mut sections.left[..]),

@@ -72,7 +72,6 @@ struct RawTheme {
     foreground: Option<Spanned<String>>,
     accent: Option<Spanned<String>>,
     font: Option<Spanned<String>>,
-    radius: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -101,7 +100,7 @@ fn color_at(text: &str, key: &str, v: &Option<Spanned<String>>, fallback: Color)
 
 const DEFAULT_HEIGHT: i32 = 30;
 /// Valid bar height range in pixels. The upper bound is defensive: the value is also `layer.set_size`,
-/// input to each output's `SlotPool::new(width * height * 4)` and to the derived ratios (radius / padding),
+/// input to each output's `SlotPool::new(width * height * 4)` and to the derived notification ratios,
 /// a mistyped number must not turn into a multi-terabyte allocation request.
 const HEIGHT_RANGE: std::ops::RangeInclusive<i32> = 1..=HEIGHT_MAX;
 const HEIGHT_MAX: i32 = 256;
@@ -138,7 +137,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let mut theme = Theme::defaults(height);
     theme.padding = raw.bar.padding.unwrap_or(theme.padding);
     theme.spacing = raw.bar.spacing.unwrap_or(theme.spacing);
-    theme.radius = raw.theme.radius.unwrap_or(theme.radius);
     theme.background = color_at(text, "theme.background", &raw.theme.background, theme.background)?;
     theme.foreground = color_at(text, "theme.foreground", &raw.theme.foreground, theme.foreground)?;
     theme.accent = color_at(text, "theme.accent", &raw.theme.accent, theme.accent)?;
@@ -204,7 +202,6 @@ spacing = 6
 background = "#1a1a1aee"
 foreground = "#dcdcdc"
 font = "Inter 11"
-radius = 15
 
 [bar.left]
 modules = [ { kind = "clock", format = "%H:%M" } ]
@@ -229,7 +226,6 @@ max_visible = 3
         assert_eq!(c.bar.left.len(), 1);
         assert!(c.bar.center.is_empty());
         assert!(matches!(c.bar.right[0], ModuleSpec::Exec { .. }));
-        assert_eq!(c.theme.radius, 15);
         assert_eq!(c.theme.background.a, 0xee);
         assert_eq!(c.theme.font.size, 11.0);
         assert_eq!(c.theme.font.family, "Inter");
@@ -246,7 +242,6 @@ max_visible = 3
         assert_eq!(c.bar.height, 30);
         assert_eq!(c.bar.margin, 0);
         assert_eq!(c.bar.right.len(), 2);
-        assert_eq!(c.theme.radius, 15);
         let notification = c.notification.as_ref().expect("the template enables notifications");
         assert_eq!(notification.position, NotificationPosition::Right);
         assert_eq!(notification.max_visible, 4);
@@ -277,12 +272,18 @@ max_visible = 3
     }
 
     #[test]
-    fn radius_defaults_to_half_height() {
+    fn bar_height_derives_notification_proportions() {
         let c = parse("[bar]\nheight = 24\n").unwrap();
-        assert_eq!(c.theme.radius, 12);
         assert_eq!(c.theme.card_gap, 4);
         assert!(c.bar.left.is_empty() && c.bar.right.is_empty());
         assert_eq!(c.bar.height, 24);
+    }
+
+    #[test]
+    fn bar_radius_is_rejected_instead_of_silently_ignored() {
+        let error = parse("[theme]\nradius = 0\n").unwrap_err();
+        assert!(error.contains("line 2"), "{error}");
+        assert!(error.contains("radius"), "{error}");
     }
 
     #[test]

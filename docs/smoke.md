@@ -80,10 +80,10 @@ enter_ms = 600
 exit_ms = 400
 ```
 
-- [ ] The bar contains only its configured `clock` / `exec` modules; there is no reserved notification gap.
+- [ ] The bar is a full-width square-cornered rectangle like swaybar / i3bar; its four corners contain background with no capsule cutout. It contains only its configured `clock` / `exec` modules and has no reserved notification gap.
 - [ ] The first card starts below `bar.margin + bar.height + card_gap`; it neither overlaps nor shares material with the bar.
 - [ ] A one-line card has the derived minimum height; body/actions grow the same card without changing its fixed width.
-- [ ] All corners read as continuous/squircle curves. The translucent material does not show a doubled overlap, black seam or square notch.
+- [ ] All notification-card corners read as continuous/squircle curves. The translucent material does not show a doubled overlap, black seam or square notch.
 - [ ] `left`, `center`, and `right` anchor the whole vertical column correctly. Side cards keep `2 × card_gap` from the screen edge; the centre card is truly centred.
 - [ ] Three simultaneous notifications produce three independent cards in new → old order with one `card_gap` between them. No card is collapsed into a peek pill.
 - [ ] Each card enters with its own scale/fade spring; older cards spring to new vertical positions. Replacing an id updates in place without replaying enter.

@@ -24,7 +24,6 @@ pub struct Theme {
     /// the monospace grid instead of emphasising the title.
     pub secondary: Color,
     pub height: i32,
-    pub radius: i32,
     pub padding: i32,
     pub spacing: i32,
     /// Gap between notification cards, default height/5
@@ -52,7 +51,6 @@ impl Theme {
             accent: Color::rgba(0x88, 0xc0, 0xd0, 0xff),
             font: TextStyle::new(11.0, "monospace"),
             height,
-            radius: height / 2,
             padding: 8,
             spacing: 6,
             card_gap: (height / 5).max(2),
@@ -92,10 +90,9 @@ mod tests {
     #[test]
     fn derived_proportions() {
         let t = Theme::defaults(30);
-        assert_eq!(t.radius, 15);
         assert_eq!(t.card_gap, 6);
         assert_eq!(t.card_padding, 15);
-        // Apple's ratios: the expanded Live Activity is 10× the island height wide and 1.2× it round.
+        // The card ratios are fixed cornice proportions rather than content-derived dimensions.
         assert_eq!(t.card_w, 300);
         assert_eq!(t.card_radius, 36);
         assert_eq!(t.card_min_h(), 75);

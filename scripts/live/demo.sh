@@ -70,7 +70,6 @@ spacing  = 6
 background = "#1a1a1aee"
 foreground = "#dcdcdc"
 accent     = "#88c0d0"
-radius     = 15
 
 [notification]
 position = "right"

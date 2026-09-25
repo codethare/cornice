@@ -11,13 +11,12 @@
 
 [bar]
 # Bar height in pixels. Range 1..=256.
-# It is also the basis the shm pool size and the radius/padding are derived from, so the ceiling is defensive: a
+# It is also the basis the shm pool size and notification proportions are derived from, so the ceiling is defensive: a
 # mistyped number must not turn into a terabyte-scale allocation request.
 height  = 30        # default 30
 # Distance from the bar to the top edge of the screen, in pixels.
 margin  = 0         # default 0
-# Left/right inset inside the bar, in pixels. On top of that the rounded ends inset by another r*(1-1/√2) (4px at radius 15) —
-# a rounded end is not a straight edge, so a bbox measurement makes the inset look smaller than it is; this optical correction is tied to radius and is not configurable.
+# Left/right inset inside the square-cornered bar, in pixels.
 padding = 8         # default 8
 # Gap between adjacent modules, in pixels.
 spacing = 6         # default 6
@@ -29,8 +28,6 @@ foreground = "#dcdcdc"      # text colour, default #dcdcdc
 accent     = "#88c0d0"      # accent colour (critical notifications etc.), default #88c0d0
 # Font: "family size". Omit the size to keep the default size of 11.
 font       = "monospace 11" # default monospace 11
-# Corner radius in pixels. Absent = height/2, i.e. a capsule.
-radius     = 15             # default height/2
 # Notification spacing, padding, width, radius and minimum height are derived from height and are not configurable.
 # Text is placed by cap height. Each independent card keeps a fixed width; body/action rows grow its height,
 # and the first card starts one card_gap below the bar.

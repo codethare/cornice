@@ -99,7 +99,6 @@ spacing  = 6
 background = "#1a1a1aee"
 foreground = "#dcdcdc"
 accent     = "#88c0d0"
-radius     = 15
 
 [notification]
 position = "right"
@@ -201,14 +200,13 @@ read -r _ _ _ _ lcount < <(px near "$W/bar.ppm" 0 0 300 "$BAR_H" 220 220 220 60)
 read -r _ _ _ _ rcount < <(px near "$W/bar.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
 ge 1 "$lcount" "left section draws text (clock)"
 ge 1 "$rcount" "right section draws text (exec)"
-# Optical inset at the pill's rounded ends: padding (8) + the corner keyline r(1-1/√2) = 4 at radius 15,
-# so the ink must clear x = 12 by its own side bearing and both ends must match.
+# The square bar uses only the configured 8 px padding; glyph side bearings may add a small visual gap.
 read -r lx0 _ _ _ _ < <(px near "$W/bar.ppm" 0 0 300 "$BAR_H" 220 220 220 60)
 read -r _ _ rx1 _ _ < <(px near "$W/bar.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
-ge 12 "$lx0" "left text clears the pill's rounded end (ink starts at $lx0)"
-le 15 "$lx0" "...without drifting away from it"
-ge $((OUT_W - 16)) "$rx1" "right text keeps the mirrored inset (ink ends at $rx1)"
-le $((OUT_W - 13)) "$rx1" "...without drifting away from it"
+ge 8 "$lx0" "left text respects the square bar's padding (ink starts at $lx0)"
+le 12 "$lx0" "...without drifting away from it"
+ge $((OUT_W - 11)) "$rx1" "right text keeps the mirrored padding (ink ends at $rx1)"
+le $((OUT_W - 8)) "$rx1" "...without drifting away from it"
 read -r mx0 _ mx1 _ mcount < <(px near "$W/bar.ppm" 500 0 780 "$BAR_H" 220 220 220 60)
 if [ "$mcount" -gt 0 ]; then
     mid=$(( (mx0 + mx1) / 2 ))

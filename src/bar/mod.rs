@@ -76,22 +76,10 @@ pub struct BarLayout {
     pub right: Vec<Rect>,
 }
 
-/// Optical inset for the bar's rounded ends.
-///
-/// A pill's end is not a straight edge: the boundary curves away from the text, so a gap measured from the
-/// bounding box reads smaller than the measured one and the eye hangs the text in the corner. Content is pushed
-/// in to the corner's 45° keyline — the same rule keyline grids use when a circle has to read the same size as a
-/// square next to it. The corners are continuous (superellipse, see `geom::CORNER_EXPONENT`), so this is
-/// `geom::corner_inset`, not `r(1-1/√2)`: a softer corner leaves less to correct. The correction belongs to the
-/// component, so it is derived from `radius` and is not a knob.
-pub fn end_inset(radius: i32) -> i32 {
-    crate::geom::corner_inset(radius)
-}
-
 /// Each section lays its items out by `spacing`; center is allocated first among the three.
 pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout {
     let h = theme.height;
-    let p = (theme.padding + end_inset(theme.radius)).max(0);
+    let p = theme.padding.max(0);
     let s = theme.spacing.max(0);
 
     let run = |ws: &[i32], start: i32| -> Vec<Rect> {
@@ -99,8 +87,6 @@ pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout
         ws.iter()
             .map(|w| {
                 let r = Rect::new(x, 0, *w, h);
-                // zero-width modules take no gap
-                // so the modules beside it do not shift when the neighbouring modules keep their relative positions.
                 if *w > 0 {
                     x += w + s;
                 }
@@ -184,33 +170,21 @@ mod tests {
 
     #[test]
     fn three_sections_are_placed_as_specified() {
-        let t = Theme::defaults(30); // padding 8, spacing 6, radius 15
-        let i = end_inset(t.radius); // 2: the continuous corner is fuller than a circular one
-        assert_eq!(i, 2);
+        let t = Theme::defaults(30);
         let out = layout(&widths(&[20, 20], &[50], &[30, 30]), 1000, &t);
-        assert_eq!(out.left[0], Rect::new(8 + i, 0, 20, 30));
-        assert_eq!(out.left[1], Rect::new(8 + i + 20 + 6, 0, 20, 30));
-        // center is centred on the screen midline, not on the space that is left over
+        assert_eq!(out.left[0], Rect::new(8, 0, 20, 30));
+        assert_eq!(out.left[1], Rect::new(8 + 20 + 6, 0, 20, 30));
         assert_eq!(out.center[0], Rect::new(500 - 25, 0, 50, 30));
-        // right hugs the right edge; its internals still run left to right
-        assert_eq!(out.right[0], Rect::new(1000 - 8 - i - 66, 0, 30, 30));
-        assert_eq!(out.right[1], Rect::new(1000 - 8 - i - 30, 0, 30, 30));
-
+        assert_eq!(out.right[0], Rect::new(1000 - 8 - 66, 0, 30, 30));
+        assert_eq!(out.right[1], Rect::new(1000 - 8 - 30, 0, 30, 30));
     }
 
-    /// Both ends keep the same optical inset, so the text does not look pinned to one corner of the pill.
     #[test]
-    fn pill_ends_are_inset_by_the_corner_keyline() {
+    fn square_bar_uses_only_configured_padding() {
         let t = Theme::defaults(30);
-        let i = end_inset(t.radius);
-        for radius in [0, 2, 15, 30] {
-            assert!(end_inset(radius) >= 0);
-            assert!(end_inset(radius) <= radius / 3 + 1, "the inset stays a corner correction, not a margin");
-        }
-        assert_eq!(end_inset(0), 0, "a square bar needs no corner correction");
         let out = layout(&widths(&[10], &[], &[10]), 1000, &t);
-        assert_eq!(out.left[0].x, t.padding + i);
-        assert_eq!(out.right[0].right(), 1000 - t.padding - i);
+        assert_eq!(out.left[0].x, t.padding);
+        assert_eq!(out.right[0].right(), 1000 - t.padding);
     }
 
     #[test]
