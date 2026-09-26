@@ -80,7 +80,7 @@ enter_ms = 600
 exit_ms = 400
 ```
 
-- [ ] The bar is a full-width square-cornered rectangle like swaybar / i3bar; its four corners contain background with no capsule cutout. It contains only its configured `clock` / `exec` modules and has no reserved notification gap.
+- [ ] The bar is a full-width square-cornered rectangle like swaybar / i3bar; its four corners contain background with no capsule cutout. With `background_transparency = 0`, `50`, and `100`, only the bar background fades; at 100 the text remains visible and notification cards keep their normal opacity. It contains only its configured `clock` / `exec` modules and has no reserved notification gap.
 - [ ] The first card starts below `bar.margin + bar.height + card_gap`; it neither overlaps nor shares material with the bar.
 - [ ] A one-line card has the derived minimum height; body/actions grow the same card without changing its fixed width.
 - [ ] All notification-card corners read as continuous/squircle curves. The translucent material does not show a doubled overlap, black seam or square notch.
@@ -91,6 +91,7 @@ exit_ms = 400
 - [ ] Left-clicking an action emits `ActionInvoked` before closing; clicking elsewhere on that card emits `NotificationClosed(..., 2)`. Middle-click also closes the card body.
 - [ ] Transparent pixels inside and around each surface pass clicks through to the window below; removing `[notification]` creates no card surface while the D-Bus daemon still runs.
 - [ ] No buffer is attached before the first configure; the compositor log has no protocol error.
+- [ ] `background_transparency = -1` and `101` both fail with `line:column`; values `0`, `50`, and `100` are accepted.
 - [ ] Sending more than `max_visible` keeps the excess queued. Closing a visible card promotes the next notification with an enter animation.
 - [ ] With a second output focused, each newly created card appears on that output. Removing the output rebuilds live cards on the remaining/default output.
 - [ ] Idle CPU does not show sustained 60 fps wakeups after all enter/exit/reflow motion has completed.

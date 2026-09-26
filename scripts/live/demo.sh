@@ -63,6 +63,7 @@ cat > "$W/cfg/cornice/config.toml" <<'EOF'
 [bar]
 height   = 30
 margin   = 0
+background_transparency = 0
 padding  = 8
 spacing  = 6
 

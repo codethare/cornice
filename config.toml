@@ -16,6 +16,9 @@
 height  = 30        # default 30
 # Distance from the bar to the top edge of the screen, in pixels.
 margin  = 0         # default 0
+# Extra bar-background transparency, 0..100. 0 keeps the alpha in theme.background unchanged; 100 makes the
+# bar background fully transparent. Text stays visible, and notification cards are not affected.
+background_transparency = 0
 # Left/right inset inside the square-cornered bar, in pixels.
 padding = 8         # default 8
 # Gap between adjacent modules, in pixels.
@@ -23,7 +26,7 @@ spacing = 6         # default 6
 
 [theme]
 # Colour syntax: #rgb / #rrggbb / #rrggbbaa (ASCII only)
-background = "#1a1a1aee"    # bar and notification card background, default #1a1a1aee
+background = "#1a1a1aee"    # bar and notification card base colour, default #1a1a1aee
 foreground = "#dcdcdc"      # text colour, default #dcdcdc
 accent     = "#88c0d0"      # accent colour (critical notifications etc.), default #88c0d0
 # Font: "family size". Omit the size to keep the default size of 11.

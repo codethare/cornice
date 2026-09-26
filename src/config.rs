@@ -57,6 +57,7 @@ struct RawConfig { bar: RawBar, theme: RawTheme, notification: Option<RawNotific
 struct RawBar {
     /// `Spanned` exists so an out-of-range error points at the real line and column.
     height: Option<Spanned<i32>>,
+    background_transparency: Option<Spanned<i32>>,
     margin: Option<i32>, padding: Option<i32>, spacing: Option<i32>,
     left: RawSection, center: RawSection, right: RawSection,
 }
@@ -104,6 +105,7 @@ const DEFAULT_HEIGHT: i32 = 30;
 /// a mistyped number must not turn into a multi-terabyte allocation request.
 const HEIGHT_RANGE: std::ops::RangeInclusive<i32> = 1..=HEIGHT_MAX;
 const HEIGHT_MAX: i32 = 256;
+const BAR_TRANSPARENCY_RANGE: std::ops::RangeInclusive<i32> = 0..=100;
 
 fn height_at(text: &str, v: &Option<Spanned<i32>>) -> Result<i32, String> {
     let Some(v) = v else { return Ok(DEFAULT_HEIGHT) };
@@ -113,6 +115,16 @@ fn height_at(text: &str, v: &Option<Spanned<i32>>) -> Result<i32, String> {
         return Err(format!("{l}:{c}: bar.height: bar height must be within {HEIGHT_RANGE:?} pixels, currently {h}"));
     }
     Ok(h)
+}
+
+fn bar_transparency_at(text: &str, value: &Option<Spanned<i32>>) -> Result<u8, String> {
+    let Some(value) = value else { return Ok(0) };
+    let percent = *value.get_ref();
+    if !BAR_TRANSPARENCY_RANGE.contains(&percent) {
+        let (line, column) = line_col(text, value.span().start);
+        return Err(format!("{line}:{column}: bar.background_transparency: must be within {BAR_TRANSPARENCY_RANGE:?} percent, currently {percent}"));
+    }
+    Ok(percent as u8)
 }
 
 fn modules_of(spanned: &[Spanned<ModuleSpec>]) -> Vec<ModuleSpec> { spanned.iter().map(|m| m.get_ref().clone()).collect() }
@@ -134,7 +146,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("{e}"))?;
 
     let height = height_at(text, &raw.bar.height)?;
+    let bar_transparency = bar_transparency_at(text, &raw.bar.background_transparency)?;
     let mut theme = Theme::defaults(height);
+    theme.bar_transparency = bar_transparency;
     theme.padding = raw.bar.padding.unwrap_or(theme.padding);
     theme.spacing = raw.bar.spacing.unwrap_or(theme.spacing);
     theme.background = color_at(text, "theme.background", &raw.theme.background, theme.background)?;
@@ -195,6 +209,7 @@ mod tests {
 [bar]
 height = 30
 margin = 0
+background_transparency = 25
 padding = 8
 spacing = 6
 
@@ -221,6 +236,7 @@ max_visible = 3
     fn parses_sample_and_derives_defaults() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(c.bar.height, 30);
+        assert_eq!(c.theme.bar_transparency, 25);
         assert_eq!(c.theme.padding, 8);
         assert_eq!(c.theme.spacing, 6);
         assert_eq!(c.bar.left.len(), 1);
@@ -324,6 +340,22 @@ max_visible = 3
             assert!(e.starts_with("2:"), "the error message should start with `line:col:`: {e}");
             assert!(e.contains("bar.height"), "{e}");
             assert!(e.contains(shown), "{e}");
+        }
+    }
+
+    #[test]
+    fn bar_background_transparency_accepts_only_zero_to_one_hundred() {
+        for (value, expected) in [(0, 0), (50, 50), (100, 100)] {
+            let config = parse(&format!("[bar]\nbackground_transparency = {value}\n")).unwrap();
+            assert_eq!(config.theme.bar_transparency, expected);
+        }
+        assert_eq!(parse("[bar]\n").unwrap().theme.bar_transparency, 0);
+
+        for value in [-1, 101] {
+            let error = parse(&format!("[bar]\nbackground_transparency = {value}\n")).unwrap_err();
+            assert!(error.starts_with("2:"), "{error}");
+            assert!(error.contains("bar.background_transparency"), "{error}");
+            assert!(error.contains(&value.to_string()), "{error}");
         }
     }
 

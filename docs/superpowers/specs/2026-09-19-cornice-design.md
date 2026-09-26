@@ -1,11 +1,11 @@
 # cornice 设计文档
 
-日期:2026-09-25(v7 — bar 改为直角)
+日期:2026-09-25(v8 — bar 背景透明度可配)
 状态:已确认(通知为 bar 外的独立卡片列;bar 固定为直角)
 
 ## 1. 目标
 
-一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。bar 与 swaybar / i3bar 一样使用完整直角矩形,不做胶囊或圆角端部。
+一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。bar 与 swaybar / i3bar 一样使用完整直角矩形,不做胶囊或圆角端部;背景透明度可在 0–100% 之间调节。
 
 通知不再插入 bar 的某个模块槽位,也不再从 bar 材质向下拉伸。通知显示在 bar 外侧下方,每条通知是一张独立卡片;多条通知按新 → 旧纵向排列,整列可以锚定在屏幕左上、中上或右上。卡片形状、间距、材质和动效参考 macOS 27 Golden Gate 的 Liquid Glass 设计语言,但使用 cornice 自己的比例和纯软件渲染能力。
 
@@ -94,6 +94,7 @@ top_margin = bar.margin + bar.height + card_gap
 [bar]
 height   = 30
 margin   = 0
+background_transparency = 0
 padding  = 8
 spacing  = 6
 
@@ -123,6 +124,8 @@ exit_ms      = 160
 
 bar 没有圆角配置:背景直接用 `fill_rect` 铺满 surface,左右内容只服从 `bar.padding`。旧的 `theme.radius` 会被未知字段校验拒绝,不会静默忽略。
 
+`bar.background_transparency` 是可选的 0–100 百分比:缺省 `0`;`0` 保持 `theme.background` 自带的 alpha,`100` 让 bar 背景完全透明。它只改变 bar 的绘制颜色,不改变文字,也不影响复用 `theme.background` 的通知卡片。超出 0–100 在解析层以 `line:column` 报错。
+
 `[notification]` 是通知系统的开关:
 
 - 整个 section 缺失时,D-Bus 守护进程仍运行并处理/到期通知,但不创建通知 surface。
@@ -148,7 +151,7 @@ trait Module {
 }
 ```
 
-- bar 背景始终是直角矩形;圆角只属于通知卡片与 action 胶囊。
+- bar 背景始终是直角矩形;圆角只属于通知卡片与 action 胶囊。背景 alpha 为 `round(background.a × (100 - background_transparency) / 100)`。
 - left 靠左排,right 靠右排,center 以屏幕中线居中;两端只使用 `bar.padding`,没有圆角 optical inset。
 - 三者重叠时 center 优先,两侧模块按可用宽度截断。
 - 模块之间使用 `bar.spacing`;没有通知模块,因此通知出现和消失不会改变 bar 内任何模块的位置。
@@ -273,7 +276,7 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 
 ### Smoke 重点
 
-- bar 四角为完整直角,没有 capsule 端部或透明圆角;第一条通知出现时 bar 文本不移动。
+- bar 四角为完整直角,没有 capsule 端部或透明圆角;`background_transparency` 为 0/50/100 时背景逐级变透明,100 时仅背景消失,文字和通知卡片不变。
 - 单条通知是一张完整独立卡,不是 bar 的延伸;短通知也不与 bar 拼接。
 - 多条通知新 → 旧纵向排列,每张有独立背景、连续圆角、间距和点击区域。
 - `left` / `center` / `right` 三种位置整列对齐正确,透明区域点击穿透。

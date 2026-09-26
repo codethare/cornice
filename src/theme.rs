@@ -15,6 +15,8 @@ const CARD_RADIUS_PER_HEIGHT: f32 = 1.2;
 #[derive(Clone)]
 pub struct Theme {
     pub background: Color,
+    /// Extra transparency applied only to the bar: 0 keeps `background.a`, 100 makes the bar invisible.
+    pub bar_transparency: u8,
     pub foreground: Color,
     pub accent: Color,
     pub font: TextStyle,
@@ -36,6 +38,12 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn bar_background(&self) -> Color {
+        let remaining = 100 - self.bar_transparency as u16;
+        let alpha = (self.background.a as u16 * remaining + 50) / 100;
+        Color::rgba(self.background.r, self.background.g, self.background.b, alpha as u8)
+    }
+
     /// A short desktop banner still needs enough vertical room for one balanced line.
     pub fn card_min_h(&self) -> i32 {
         let line = (self.font.size * 1.35).ceil() as i32;
@@ -46,6 +54,7 @@ impl Theme {
         let foreground = Color::rgba(0xdc, 0xdc, 0xdc, 0xff);
         Self {
             background: Color::rgba(0x1a, 0x1a, 0x1a, 0xee),
+            bar_transparency: 0,
             foreground,
             secondary: Color::rgba(foreground.r, foreground.g, foreground.b, (foreground.a as f32 * 0.72) as u8),
             accent: Color::rgba(0x88, 0xc0, 0xd0, 0xff),
@@ -85,6 +94,23 @@ mod tests {
         let f = parse_font("monospace", 10.0);
         assert_eq!(f.family, "monospace");
         assert_eq!(f.size, 10.0);
+    }
+
+    #[test]
+    fn bar_transparency_scales_only_the_bar_background() {
+        let mut theme = Theme::defaults(30);
+        assert_eq!(theme.bar_transparency, 0);
+        assert_eq!(theme.bar_background(), theme.background);
+
+        theme.bar_transparency = 50;
+        assert_eq!(theme.bar_background(), Color::rgba(0x1a, 0x1a, 0x1a, 0x77));
+        assert_eq!(theme.background.a, 0xee, "notification cards keep the configured colour");
+
+        theme.bar_transparency = 1;
+        assert_eq!(theme.bar_background().a, 236, "alpha scaling rounds to the nearest step");
+
+        theme.bar_transparency = 100;
+        assert_eq!(theme.bar_background().a, 0);
     }
 
     #[test]
