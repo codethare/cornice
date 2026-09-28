@@ -254,10 +254,20 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 - compositor 关闭通知 surface 时不退出进程;清掉该 surface 后按当前队列重建。
 - 输出销毁时,落在该输出的通知 surface 被销毁并在新的默认 output 上重建。
 
+### 调试重启(SIGUSR1)
+
+cornice 使用 `KeyboardInteractivity::None`,结构上不能接收全局按键;键必须在 river/tailrace(或 sway/hyprland)侧绑定。
+
+- cornice 启动时安装 `SIGUSR1`;信号处理函数只调用 `execv` 重新执行当前二进制(路径在启动时准备好),环境保持不变,因此配置会被重新读取,进程 PID 不变。
+- 信号处理函数不做分配、不加锁;`execv` 与 `_exit` 都是异步信号安全的,这是不使用新信号依赖的前提。
+- 典型绑定:`riverctl map normal Super+Shift R spawn 'pkill -USR1 -x cornice'`;sway/hyprland 用对应的 `exec`/`bind` 语法发送同一个信号。
+- 这是 debug 入口,不是 supervisor/PID 管理;若希望失败后自动拉起,由 WM 或服务管理器负责。
+
 ## 10. 文件职责
 
 | 文件 | 责任 |
 |---|---|
+| `main.rs` | 进程装配(读配置、启动事件循环)与 `SIGUSR1` debug 重启处理器 |
 | `geom.rs` | `Rect` / `Color`;alpha 透传,只在 `to_shm_bytes` 预乘 |
 | `canvas.rs` | `wl_shm` 写入、裁剪、连续圆角;不知道文字 |
 | `text.rs` | cosmic-text、宽度裁剪;不知道布局 |
@@ -299,6 +309,7 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 - 入场和退场 spring 可见且不造成文本跳闪;关闭一条后其余卡平滑补位。
 - river 广告 `ext_foreign_toplevel_list_v1` 时,打开/关闭窗口会让对应 monogram chip 出现/消失;同一 app_id 开三个窗口时右下角显示 `3`,只开一个时不显示角标。
 - 将 `{ kind = "applications" }` 放到 left / center / right 的任一个 module 列表,chip 按该区域对齐;未广告协议时 bar 不报错、不占位。
+- 调试重启:绑定 `pkill -USR1 -x cornice` 后,进程原地重启、重新读取配置;通知名不被旧连接占用,bar 与通知卡片正常重建。
 - 退场/透明区域不吞点击;action 优先于主体关闭。
 - 首个 configure 前没有 buffer,没有 `wl_surface` 协议错误。
 - river + tailrace 下每张通知路由到焦点 output,输出移除后能重建。

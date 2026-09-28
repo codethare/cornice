@@ -96,6 +96,7 @@ exit_ms = 400
 - [ ] No buffer is attached before the first configure; the compositor log has no protocol error.
 - [ ] `background_transparency = -1` and `101` both fail with `line:column`; values `0`, `50`, and `100` are accepted.
 - [ ] Sending more than `max_visible` keeps the excess queued. Closing a visible card promotes the next notification with an enter animation.
+- [ ] Debug restart: bind a WM key to `pkill -USR1 -x cornice` (river: `riverctl map normal Super+Shift R spawn 'pkill -USR1 -x cornice'`). One press rebuilds the bar and notification cards from a fresh process, re-reads the config, keeps the same PID, and does not report `org.freedesktop.Notifications is already taken`.
 - [ ] With a second output focused, each newly created card appears on that output. Removing the output rebuilds live cards on the remaining/default output.
 - [ ] Idle CPU does not show sustained 60 fps wakeups after all enter/exit/reflow motion has completed.
 
