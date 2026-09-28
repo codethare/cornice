@@ -156,6 +156,11 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         let changed = match state.queue.apply(request, now) {
             crate::notify::queue::Outcome::Added(_) | crate::notify::queue::Outcome::Replaced(_) => true,
             crate::notify::queue::Outcome::CloseRequested(id) => state.remove_notification(id, 3),
+            crate::notify::queue::Outcome::ClosedAll(ids) => {
+                let mut changed = false;
+                for id in ids { changed |= state.remove_notification(id, 3); }
+                changed
+            }
             crate::notify::queue::Outcome::Ignored => false,
         };
         if changed {

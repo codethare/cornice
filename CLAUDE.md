@@ -27,6 +27,7 @@ The design doc is the only authority: `docs/superpowers/specs/2026-09-19-cornice
 - **Proportions**: `card_gap = max(height/5, 2)`, `card_padding = max(height/2, 4)` (`theme.rs::Theme::defaults`). Derived typography: text uses `TextEngine::optical_top`; the font cap metric is measured from an `H` on the first frame and cached. Notification width is fixed at `clamp(10 × height, 80, 420)`, radius is `1.2 × height`, minimum height is `Theme::card_min_h`, and content may grow it; the first card starts at `bar.margin + height + card_gap`, with side inset `2 × card_gap`. Notification corners are continuous (`geom::CORNER_EXPONENT = 4`), not circular arcs. For any new dimension, ask "can this be derived from height?" first.
 
 - **Debug restart**: `SIGUSR1` re-execs the current binary through a raw async-signal-safe `execv` handler in `main.rs`; the key binding lives in the WM (`pkill -USR1 -x cornice`). cornice is `KeyboardInteractivity::None`, so it can never receive global keys itself.
+- **CLI**: no arguments starts the daemon; `cornice notification dismiss <id>` and `cornice notification dismiss -a|--all` are short-lived client processes that only make a D-Bus call (no config, no Wayland). The verb follows `makoctl` / `fnottctl`, and the `notification` group keeps a later bar-side command from colliding with it. Single dismiss is the spec `CloseNotification`; `--all` needs cornice's own `org.cornice.Control.CloseAll` on the same object path, which stays off the spec interface.
 
 ## Files and responsibilities (do not cross the lines)
 
@@ -46,6 +47,7 @@ The design doc is the only authority: `docs/superpowers/specs/2026-09-19-cornice
 | `notify/view.rs` | Card layout, drawing, hit testing. Does not touch the protocol |
 | `wayland/mod.rs` | The only place that holds `State` and the protocol callbacks, including the `foreign_toplevel_list` snapshot. No Wayland types may appear in any other file |
 | `main.rs` | Process assembly: config load, `wayland::run`, and the `SIGUSR1` debug re-exec handler |
+| `cli.rs` | Client mode: one subcommand → one D-Bus call. No config, no Wayland |
 
 ## Applications module
 

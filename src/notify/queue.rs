@@ -22,10 +22,11 @@ pub struct Notification {
 pub enum Request {
     Notify { id: u32, replaces_id: u32, app_name: String, summary: String, body: String, actions: Vec<(String, String)>, urgency: Urgency, expire_timeout: i32 },
     Close { id: u32 },
+    CloseAll,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Outcome { Added(u32), Replaced(u32), CloseRequested(u32), Ignored }
+pub enum Outcome { Added(u32), Replaced(u32), CloseRequested(u32), ClosedAll(Vec<u32>), Ignored }
 
 pub const MAX_BODY_LINES: usize = 5;
 pub const MAX_BODY_CHARS: usize = 300;
@@ -102,6 +103,8 @@ impl Queue {
                 // a second remove in close_visible returns None and swallows the NotificationClosed signal.
                 if self.get(id).is_some() { Outcome::CloseRequested(id) } else { Outcome::Ignored }
             }
+            // Hidden entries go too: leaving them queued would resurrect cards with no way to reach them.
+            Request::CloseAll => Outcome::ClosedAll(self.items.iter().map(|n| n.id).collect()),
         }
     }
 
@@ -261,6 +264,22 @@ mod tests {
         q.apply(notify(5, 0), now);
         assert_eq!(q.apply(Request::Close { id: 5 }, now), Outcome::CloseRequested(5));
         assert_eq!(q.apply(Request::Close { id: 404 }, now), Outcome::Ignored);
+    }
+
+    #[test]
+    fn close_all_reports_hidden_entries_too() {
+        let now = Instant::now();
+        let mut q = Queue::new(2);
+        for id in 1..=3 {
+            q.apply(notify(id, 0), now);
+        }
+        // id=1 sits past max_visible and must be reported as well, or it would resurface later
+        assert_eq!(q.apply(Request::CloseAll, now), Outcome::ClosedAll(vec![3, 2, 1]), "new → old, hidden entries included");
+        assert_eq!(q.apply(Request::CloseAll, now), Outcome::ClosedAll(vec![3, 2, 1]), "reporting alone does not remove");
+        for id in 1..=3 {
+            assert!(q.remove(id).is_some());
+        }
+        assert_eq!(q.apply(Request::CloseAll, now), Outcome::ClosedAll(vec![]), "an empty queue reports nothing");
     }
 
     #[test]

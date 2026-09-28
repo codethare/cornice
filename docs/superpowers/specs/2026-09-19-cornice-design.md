@@ -179,6 +179,8 @@ trait Module {
 - `GetCapabilities` → `["body", "actions", "persistence"]`。
 - `Notify(app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout) -> id`
 - `CloseNotification(id)`
+- 自有控制面 `org.cornice.Control`(同一个对象路径,不与 spec 接口混用)的 `CloseAll()`:关闭当前队列里所有条目,可见与隐藏的都发 `NotificationClosed(id, 3)`。
+- 命令行:`cornice notification dismiss <id>` 调用 `CloseNotification`;`cornice notification dismiss -a | --all` 调用 `CloseAll`。动词取 `makoctl` / `fnottctl` 的 `dismiss`,把子命令收在 `notification` 组下,以免 bar 侧的命令以后与它相撞。两者都是短生命周期的客户端进程,不读配置、不连 Wayland;无参数启动才是守护进程。
 - `GetServerInformation` → name `cornice`,spec 1.2
 - 信号:`NotificationClosed(id, reason)`、`ActionInvoked(id, action_key)`
 
@@ -268,6 +270,7 @@ cornice 使用 `KeyboardInteractivity::None`,结构上不能接收全局按键;�
 | 文件 | 责任 |
 |---|---|
 | `main.rs` | 进程装配(读配置、启动事件循环)与 `SIGUSR1` debug 重启处理器 |
+| `cli.rs` | 客户端模式:一个子命令 = 一次 D-Bus 调用;不读配置、不连 Wayland |
 | `geom.rs` | `Rect` / `Color`;alpha 透传,只在 `to_shm_bytes` 预乘 |
 | `canvas.rs` | `wl_shm` 写入、裁剪、连续圆角;不知道文字 |
 | `text.rs` | cosmic-text、宽度裁剪;不知道布局 |
@@ -294,7 +297,7 @@ cornice 使用 `KeyboardInteractivity::None`,结构上不能接收全局按键;�
 - 三种锚点的 top margin 与 side margin
 - 不可信字段/body/action 裁剪,action 命中矩形不越界
 - 入场/退场端点、alpha/scale 单调性、完成判断、逐卡独立性
-- 队列替换、可见窗口、容量、超时、关闭原因
+- 队列替换、可见窗口、容量、超时、关闭原因、关闭全部报告的 id 集合
 - applications 分组、排序、空 app_id、monogram、数量角标、chip 宽度与图片不截断
 - `Rect` / canvas / 文本既有纯逻辑回归
 

@@ -39,16 +39,20 @@ dbus-run-session -- sh -c '
   gdbus call --session --dest org.freedesktop.Notifications \
     --object-path /org/freedesktop/Notifications \
     --method org.freedesktop.Notifications.GetCapabilities
-  gdbus call --session --dest org.freedesktop.Notifications \
+  id=$(gdbus call --session --dest org.freedesktop.Notifications \
     --object-path /org/freedesktop/Notifications \
     --method org.freedesktop.Notifications.Notify \
-    test 0 "" "title" "body" "[]" "{}" -1
+    -- test 0 "" "title" "body" "[]" "{}" -1 | sed -e "s/.*uint32 //" -e "s/,.*//")
+  ./target/debug/cornice notification dismiss "$id"
+  ./target/debug/cornice notification dismiss --all
   sleep 1
   kill %1
 '
 ```
 
-- **Proves**: the daemon owns `org.freedesktop.Notifications`, accepts `notify-send`-compatible requests and does not crash while creating card surfaces.
+Expected: `dismiss <id>` emits `NotificationClosed(id, 3)`; `dismiss --all` emits `NotificationClosed(id, 3)` for every queued id, visible or hidden; both exit 0, and an unknown subcommand or a non-numeric id exits 2 (no arguments still starts the daemon).
+
+- **Proves**: the daemon owns `org.freedesktop.Notifications`, accepts `notify-send`-compatible requests, does not crash while creating card surfaces, and `notification dismiss` reaches the same daemon as a separate process.
 - **Does not prove**: correct position, pixels, independent animations or clicks.
 
 ## 3. Headless sway startup

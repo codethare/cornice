@@ -6,8 +6,10 @@ use zbus::interface;
 use super::queue::{Request, Urgency};
 
 pub const PATH: &str = "/org/freedesktop/Notifications";
-const IFACE: &str = "org.freedesktop.Notifications";
-const BUS_NAME: &str = "org.freedesktop.Notifications";
+pub const IFACE: &str = "org.freedesktop.Notifications";
+pub const BUS_NAME: &str = "org.freedesktop.Notifications";
+/// cornice's own control surface on the same object path, kept off the spec interface so no client sees a non-standard method there.
+pub const CONTROL_IFACE: &str = "org.cornice.Control";
 
 pub struct NotifyDaemon {
     tx: calloop::channel::Sender<Request>,
@@ -53,13 +55,25 @@ impl NotifyDaemon {
     }
 }
 
+pub struct Control {
+    tx: calloop::channel::Sender<Request>,
+}
+
+#[interface(name = "org.cornice.Control")]
+impl Control {
+    fn close_all(&self) {
+        let _ = self.tx.send(Request::CloseAll);
+    }
+}
+
 /// Own the bus name and register the object; returns Err when the name is taken and the caller degrades.
 pub fn spawn(tx: calloop::channel::Sender<Request>) -> Result<Connection, String> {
     let conn = Connection::session().map_err(|e| format!("failed to connect to the session bus: {e}"))?;
     conn.request_name(BUS_NAME).map_err(|e| format!("org.freedesktop.Notifications is already taken: {e}"))?;
     conn.object_server()
-        .at(PATH, NotifyDaemon { tx, next_id: std::sync::atomic::AtomicU32::new(1) })
+        .at(PATH, NotifyDaemon { tx: tx.clone(), next_id: std::sync::atomic::AtomicU32::new(1) })
         .map_err(|e| format!("failed to register the D-Bus object: {e}"))?;
+    conn.object_server().at(PATH, Control { tx }).map_err(|e| format!("failed to register the D-Bus control interface: {e}"))?;
     Ok(conn)
 }
 

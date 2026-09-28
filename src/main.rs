@@ -1,6 +1,7 @@
 mod anim;
 mod bar;
 mod canvas;
+mod cli;
 mod config;
 mod geom;
 mod notify;
@@ -39,7 +40,7 @@ extern "C" fn restart_handler(_signal: c_int) {
     unsafe { _exit(1) }
 }
 
-/// cornice takes no arguments, so the restart keeps `argv[0]` and the current environment (`execv`).
+/// The daemon path is entered without arguments, so the restart keeps `argv[0]` and the current environment (`execv`).
 fn install_restart_handler() {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
     let exe = CString::new(exe.as_os_str().as_bytes()).expect("the executable path cannot contain NUL").into_raw();
@@ -51,6 +52,12 @@ fn install_restart_handler() {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() { std::process::exit(cli::run(&args)); }
+    run_daemon();
+}
+
+fn run_daemon() {
     install_restart_handler();
     let path = config::default_path();
     let cfg = match config::load(&path) {
