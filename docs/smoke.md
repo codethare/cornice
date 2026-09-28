@@ -14,6 +14,7 @@ Covers:
 - bar layout without a notification slot;
 - `[notification]` optional enablement, `left | center | right`, and line-numbered config errors;
 - independent card widths, content heights, vertical order/gaps, detail rhythm and untrusted action bounds;
+- `applications` grouping by `app_id`, monogram derivation, chip width and count badge;
 - per-card enter/exit/reflow motion endpoints and independence;
 - queue replacement, visibility, capacity, timeout and close semantics;
 - D-Bus-independent notification state transitions.
@@ -90,6 +91,8 @@ exit_ms = 400
 - [ ] Closing one card fades/scales it out while the remaining cards spring upward. The exiting card cannot be clicked.
 - [ ] Left-clicking an action emits `ActionInvoked` before closing; clicking elsewhere on that card emits `NotificationClosed(..., 2)`. Middle-click also closes the card body.
 - [ ] Transparent pixels inside and around each surface pass clicks through to the window below; removing `[notification]` creates no card surface while the D-Bus daemon still runs.
+- [ ] `{ kind = "applications" }` in the right, centre, or left list: each open app shows one square monogram chip; an app with three windows shows `3` at the chip's bottom-right, and an app with one window shows no badge. Opening/closing a window updates the chips and reflows the section.
+- [ ] The bar stays healthy when `ext_foreign_toplevel_list_v1` is absent: no crash, no reserved width, notification cards still work.
 - [ ] No buffer is attached before the first configure; the compositor log has no protocol error.
 - [ ] `background_transparency = -1` and `101` both fail with `line:column`; values `0`, `50`, and `100` are accepted.
 - [ ] Sending more than `max_visible` keeps the excess queued. Closing a visible card promotes the next notification with an enter animation.

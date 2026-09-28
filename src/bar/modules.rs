@@ -1,12 +1,13 @@
-//! Built-in bar modules: `clock` and `exec`.
+//! Built-in bar modules: `clock`, `exec` and `applications`.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use chrono::Local;
 
-use crate::widget::{Event, Module, Span};
+use crate::widget::{Event, Module, Span, Toplevel};
 
 pub struct Clock { pub format: String, pub text: String }
 
@@ -77,6 +78,51 @@ impl Module for Exec {
     fn spans(&self) -> Vec<Span> { vec![Span::text(self.rendered())] }
 }
 
+/// Open applications grouped by `app_id`; one monogram chip each, with the window count when it exceeds one.
+pub struct Applications {
+    groups: Vec<(String, u32)>,
+}
+
+impl Applications {
+    pub fn new() -> Self { Self { groups: Vec::new() } }
+}
+
+impl Default for Applications { fn default() -> Self { Self::new() } }
+
+/// Sorted by `app_id`, so the bar does not reshuffle as toplevels arrive in arbitrary order.
+fn group(toplevels: &[Toplevel]) -> Vec<(String, u32)> {
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    for toplevel in toplevels {
+        if toplevel.app_id.is_empty() { continue; }
+        *counts.entry(&toplevel.app_id).or_default() += 1;
+    }
+    counts.into_iter().map(|(app_id, count)| (app_id.to_string(), count)).collect()
+}
+
+/// The last reverse-DNS segment's first letter; `?` when the compositor gave no usable identity.
+fn monogram(app_id: &str) -> String {
+    let name = app_id.rsplit('.').next().unwrap_or(app_id);
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .and_then(|c| c.to_uppercase().next())
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+impl Module for Applications {
+    fn update(&mut self, ev: &Event) -> bool {
+        let Event::Toplevels(toplevels) = ev else { return false };
+        let groups = group(toplevels);
+        if groups == self.groups { return false; }
+        self.groups = groups;
+        true
+    }
+
+    fn spans(&self) -> Vec<Span> {
+        self.groups.iter().map(|(app_id, count)| Span::application(monogram(app_id), *count)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +143,31 @@ mod tests {
         assert!(e.update(&Event::Line { id: 3, text: "7".into() }));
         assert_eq!(e.spans()[0].text, "[7]");
         assert!(!e.update(&Event::Line { id: 3, text: "7".into() }), "an unchanged value is not dirty");
+    }
+
+    #[test]
+    fn applications_group_by_app_id_and_mark_counts() {
+        let mut applications = Applications::new();
+        let toplevels = vec![
+            Toplevel { app_id: "firefox".into() },
+            Toplevel { app_id: "firefox".into() },
+            Toplevel { app_id: "org.gnome.Nautilus".into() },
+        ];
+        assert!(applications.update(&Event::Toplevels(toplevels.clone())), "a changed list is dirty");
+        let mut reordered = toplevels.clone();
+        reordered.reverse();
+        assert!(!applications.update(&Event::Toplevels(reordered)), "order alone is not dirty");
+        assert!(!applications.update(&Event::Toplevels(toplevels)), "the same list is not dirty");
+        let spans = applications.spans();
+        assert_eq!(spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(), vec!["F", "N"]);
+        assert_eq!(spans.iter().map(|span| span.badge).collect::<Vec<_>>(), vec![Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn monogram_prefers_the_last_app_id_segment() {
+        assert_eq!(monogram("org.mozilla.firefox"), "F");
+        assert_eq!(monogram("kitty"), "K");
+        assert_eq!(monogram(""), "?");
     }
 
     #[test]

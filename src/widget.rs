@@ -14,15 +14,26 @@ pub struct Span {
     pub color: Option<Color>,
     pub bg: Option<Color>,
     pub action: Option<Action>,
+    /// Window count for the application monogram chip; `None` for ordinary text spans.
+    pub badge: Option<u32>,
+}
+
+/// One mapped toplevel as reported by the compositor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Toplevel {
+    pub app_id: String,
 }
 
 impl Span {
     pub fn text(text: impl Into<String>) -> Self {
         Self { text: text.into(), ..Default::default() }
     }
+    /// A square application chip: one monogram, plus the window count when it exceeds one.
+    pub fn application(monogram: impl Into<String>, count: u32) -> Self {
+        Self { text: monogram.into(), badge: Some(count), ..Default::default() }
+    }
     // Design §5 says the Span primitive covers "multi-colour text runs, notification buttons and module text" at once.
-    // v1 notification buttons build `Action` directly and bypass Span, so these two constructors have no production caller yet;
-    // the primitives are kept by design, so they are allowed deliberately — the only dead-code exemption in the tree; all other dead code is deleted.
+    // The application chips reuse it through `badge`; notification is a separate surface, so the constructors below stay minimal.
     #[allow(dead_code)]
     pub fn with_color(mut self, c: Color) -> Self { self.color = Some(c); self }
     #[allow(dead_code)]
@@ -35,6 +46,8 @@ pub enum Event {
     Wake,
     /// One line of output from the `id`-th exec module child
     Line { id: usize, text: String },
+    /// The compositor's current toplevel list, already reduced to app identity.
+    Toplevels(Vec<Toplevel>),
 }
 
 pub trait Module {
@@ -54,9 +67,11 @@ mod tests {
     fn span_helpers() {
         let s = Span::text("hi");
         assert_eq!(s.text, "hi");
-        assert!(s.color.is_none() && s.action.is_none());
+        assert!(s.color.is_none() && s.action.is_none() && s.badge.is_none());
         let s = Span::text("hi").with_color(crate::geom::Color::rgba(1, 2, 3, 4));
         assert_eq!(s.color.unwrap().r, 1);
+        let s = Span::application("F", 2);
+        assert_eq!((s.text.as_str(), s.badge), ("F", Some(2)));
     }
 
     #[test]
@@ -65,7 +80,7 @@ mod tests {
             "[bar.left]\nmodules = [ { kind = \"clock\", format = \"%H\" } ]\n[bar.right]\nmodules = [ { kind = \"exec\", command = \"echo 1\", format = \"{out}\" } ]\n",
         )
         .unwrap();
-        let (mut s, _rx) = Sections::from_config(&cfg);
+        let (mut s, _rx, _tx) = Sections::from_config(&cfg);
         assert_eq!(s.left.len(), 1);
         assert_eq!(s.right.len(), 1);
         // There must be content before the first tick: the clock's initial value is computed right away instead of waiting for the first Wake

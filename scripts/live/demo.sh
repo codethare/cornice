@@ -85,7 +85,7 @@ modules = [ { kind = "clock", format = "%H:%M" } ]
 modules = [ { kind = "exec", command = "echo cornice", format = "{out}" } ]
 
 [bar.right]
-modules = [ { kind = "exec", command = "echo 87%", format = "{out}" } ]
+modules = [ { kind = "exec", command = "echo 87%", format = "{out}" }, { kind = "applications" } ]
 EOF
 export XDG_RUNTIME_DIR=$W/run
 export WAYLAND_DISPLAY=wayland-1

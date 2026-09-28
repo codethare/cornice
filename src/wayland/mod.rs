@@ -9,6 +9,7 @@ use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_registry,
+    foreign_toplevel_list::{ForeignToplevelList, ForeignToplevelListHandler},
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -27,12 +28,13 @@ use wayland_client::{
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
+use smithay_client_toolkit::reexports::protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 
 use crate::config::NotificationPosition;
 use crate::geom::Rect;
 use crate::notify::queue::Notification;
 use crate::notify::view::{Card, Motion};
-use crate::widget::Action;
+use crate::widget::{Action, Event, Toplevel};
 
 pub const LAYER_NAMESPACE: &str = "cornice";
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -83,6 +85,8 @@ pub struct State {
     pub theme: crate::theme::Theme,
     pub text: crate::text::TextEngine,
     pub sections: crate::bar::Sections,
+    pub foreign_toplevel_list: ForeignToplevelList,
+    pub event_tx: calloop::channel::Sender<Event>,
     pub queue: crate::notify::queue::Queue,
     pub dbus: Option<zbus::blocking::Connection>,
     pub notifications: HashMap<u32, NotifSurface>,
@@ -99,10 +103,11 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         format!("layer shell unavailable: {error}\n  on river the WM must implement river-layer-shell-v1 (tailrace does)")
     })?;
     let shm = Shm::bind(&globals, &qh).map_err(|error| format!("missing wl_shm: {error}"))?;
+    let foreign_toplevel_list = ForeignToplevelList::new(&globals, &qh);
 
     let bar_height = cfg.bar.height as u32;
     let theme = cfg.theme.clone();
-    let (sections, exec_rx) = crate::bar::Sections::from_config(&cfg);
+    let (sections, event_rx, event_tx) = crate::bar::Sections::from_config(&cfg);
     let max_visible = cfg.notification.as_ref().map_or(1, |notification| notification.max_visible);
     let (notification_tx, notification_rx) = calloop::channel::channel::<crate::notify::queue::Request>();
     let dbus = match crate::notify::service::spawn(notification_tx) {
@@ -131,6 +136,8 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         theme,
         text: crate::text::TextEngine::new(),
         sections,
+        foreign_toplevel_list,
+        event_tx,
         queue: crate::notify::queue::Queue::new(max_visible),
         dbus,
         notifications: HashMap::new(),
@@ -139,7 +146,7 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
     };
 
     WaylandSource::new(connection, event_queue).insert(handle.clone()).map_err(|error| format!("failed to insert the wayland source: {error}"))?;
-    handle.insert_source(exec_rx, |message, _metadata, state: &mut State| {
+    handle.insert_source(event_rx, |message, _metadata, state: &mut State| {
         let calloop::channel::Event::Msg(event) = message else { return };
         if state.sections.update(&event) { state.redraw_all(); }
     }).map_err(|error| format!("failed to insert the exec channel: {error}"))?;
@@ -187,6 +194,22 @@ impl State {
         let outputs: Vec<_> = self.bars.keys().cloned().collect();
         for output in outputs { self.redraw(&output); }
     }
+
+    /// Snapshot the compositor's toplevels and hand them to the bar modules without holding any Wayland type there.
+    /// `exclude` is the handle sctk has not removed from its list yet when `toplevel_closed` runs.
+    fn publish_toplevels_excluding(&mut self, exclude: Option<&ExtForeignToplevelHandleV1>) {
+        let toplevels: Vec<Toplevel> = self
+            .foreign_toplevel_list
+            .toplevels()
+            .iter()
+            .filter(|handle| exclude != Some(*handle))
+            .filter_map(|handle| self.foreign_toplevel_list.info(handle))
+            .map(|info| Toplevel { app_id: info.app_id })
+            .collect();
+        let _ = self.event_tx.send(Event::Toplevels(toplevels));
+    }
+
+    fn publish_toplevels(&mut self) { self.publish_toplevels_excluding(None); }
 
     fn notification_settings(&self) -> Option<(NotificationPosition, u64, u64)> {
         self.cfg.notification.as_ref().map(|notification| (notification.position, notification.enter_ms, notification.exit_ms))
@@ -408,10 +431,33 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
             if rect.is_empty() { continue; }
             let spans = crate::bar::fit_text(&module.spans(), rect.w, text, theme);
             let mut x = rect.x;
-            for span in spans {
-                let color = span.color.unwrap_or(theme.foreground);
-                text.draw(&mut canvas, &span.text, x, top, &theme.font, color);
-                x += text.measure(&span.text, &theme.font).0.ceil() as i32;
+            for (index, span) in spans.iter().enumerate() {
+                if index > 0 { x += theme.spacing.max(0); }
+                if let Some(count) = span.badge {
+                    let icon = theme.app_icon.min(rect.h).max(1);
+                    let chip = Rect::new(x, rect.y + (rect.h - icon) / 2, icon, icon);
+                    canvas.fill_rounded_rect(chip, theme.app_icon / 4, theme.app_icon_background());
+                    let color = span.color.unwrap_or(theme.foreground);
+                    let (label_width, _) = text.measure(&span.text, &theme.font);
+                    let label_x = chip.x + ((chip.w - label_width.ceil() as i32) / 2).max(0);
+                    let label_y = text.optical_top(&theme.font, chip.y, chip.h);
+                    text.draw(&mut canvas, &span.text, label_x, label_y, &theme.font, color);
+                    if count > 1 {
+                        let style = theme.app_badge_style();
+                        let label = count.to_string();
+                        let label = crate::text::truncate_to_width(&label, (chip.w - 2).max(1) as f32, |value| text.measure(value, &style).0);
+                        let (badge_width, _) = text.measure(&label, &style);
+                        let badge_x = chip.right() - badge_width.ceil() as i32;
+                        let metrics = text.cap_metrics(&style);
+                        let badge_y = chip.bottom() - (metrics.top + metrics.cap).round() as i32;
+                        text.draw(&mut canvas, &label, badge_x, badge_y, &style, theme.accent);
+                    }
+                    x += icon;
+                } else {
+                    let color = span.color.unwrap_or(theme.foreground);
+                    text.draw(&mut canvas, &span.text, x, top, &theme.font, color);
+                    x += text.measure(&span.text, &theme.font).0.ceil() as i32;
+                }
             }
         }
     }
@@ -524,6 +570,14 @@ impl CompositorHandler for State {
         if notification.output.as_ref() != Some(output) { notification.output = Some(output.clone()); }
     }
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+}
+
+impl ForeignToplevelListHandler for State {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelList { &mut self.foreign_toplevel_list }
+
+    fn new_toplevel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: ExtForeignToplevelHandleV1) { self.publish_toplevels(); }
+    fn update_toplevel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: ExtForeignToplevelHandleV1) { self.publish_toplevels(); }
+    fn toplevel_closed(&mut self, _: &Connection, _: &QueueHandle<Self>, handle: ExtForeignToplevelHandleV1) { self.publish_toplevels_excluding(Some(&handle)); }
 }
 
 impl ShmHandler for State {

@@ -38,6 +38,8 @@ pub struct Bar {
 pub enum ModuleSpec {
     Clock { #[serde(default = "default_clock_format")] format: String },
     Exec { command: String, #[serde(default)] format: String },
+    /// Open applications grouped by `app_id`, rendered as monogram chips with a window-count badge.
+    Applications,
 }
 
 fn default_clock_format() -> String { "%H:%M".to_string() }
@@ -257,7 +259,8 @@ max_visible = 3
         let c = parse(include_str!("../config.toml")).unwrap();
         assert_eq!(c.bar.height, 30);
         assert_eq!(c.bar.margin, 0);
-        assert_eq!(c.bar.right.len(), 2);
+        assert_eq!(c.bar.right.len(), 3);
+        assert_eq!(c.bar.right[2], ModuleSpec::Applications);
         let notification = c.notification.as_ref().expect("the template enables notifications");
         assert_eq!(notification.position, NotificationPosition::Right);
         assert_eq!(notification.max_visible, 4);

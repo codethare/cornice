@@ -8,7 +8,7 @@ use crate::text::{truncate_to_width, TextEngine};
 use crate::theme::Theme;
 use crate::widget::{Event, Module, Span};
 
-pub use modules::{Clock, Exec};
+pub use modules::{Applications, Clock, Exec};
 
 pub struct Sections {
     pub left: Vec<Box<dyn Module>>,
@@ -17,14 +17,14 @@ pub struct Sections {
 }
 
 impl Sections {
-    /// Returns (sections, the receiving end of the exec line channel); `State` attaches the receiver to calloop.
-    pub fn from_config(cfg: &Config) -> (Self, calloop::channel::Channel<Event>) {
-        let (exec_tx, exec_rx) = calloop::channel::channel::<Event>();
+    /// Returns sections, the receiver for module events and the sender the Wayland callbacks use for toplevel updates.
+    pub fn from_config(cfg: &Config) -> (Self, calloop::channel::Channel<Event>, calloop::channel::Sender<Event>) {
+        let (event_tx, event_rx) = calloop::channel::channel::<Event>();
         let mut exec_id = 0usize;
-        let left = build(&cfg.bar.left, &mut exec_id, &exec_tx);
-        let center = build(&cfg.bar.center, &mut exec_id, &exec_tx);
-        let right = build(&cfg.bar.right, &mut exec_id, &exec_tx);
-        (Self { left, center, right }, exec_rx)
+        let left = build(&cfg.bar.left, &mut exec_id, &event_tx);
+        let center = build(&cfg.bar.center, &mut exec_id, &event_tx);
+        let right = build(&cfg.bar.right, &mut exec_id, &event_tx);
+        (Self { left, center, right }, event_rx, event_tx)
     }
 
     pub fn update(&mut self, ev: &Event) -> bool {
@@ -36,13 +36,7 @@ impl Sections {
     }
 
     fn widths_of(modules: &mut [Box<dyn Module>], text: &mut TextEngine, theme: &Theme) -> Vec<i32> {
-        modules
-            .iter_mut()
-            .map(|m| {
-                let total: f32 = m.spans().iter().map(|s| text.measure(&s.text, &theme.font).0).sum();
-                total.ceil() as i32
-            })
-            .collect()
+        modules.iter_mut().map(|module| spans_width(&module.spans(), text, theme)).collect()
     }
 
     pub fn widths(&mut self, text: &mut TextEngine, theme: &Theme) -> SectionWidths {
@@ -54,15 +48,16 @@ impl Sections {
     }
 }
 
-fn build(specs: &[crate::config::ModuleSpec], exec_id: &mut usize, exec_tx: &calloop::channel::Sender<Event>) -> Vec<Box<dyn Module>> {
+fn build(specs: &[crate::config::ModuleSpec], exec_id: &mut usize, event_tx: &calloop::channel::Sender<Event>) -> Vec<Box<dyn Module>> {
     specs
         .iter()
         .map(|spec| match spec {
             crate::config::ModuleSpec::Clock { format } => Box::new(Clock::new(format.clone())) as Box<dyn Module>,
             crate::config::ModuleSpec::Exec { command, format } => {
                 *exec_id += 1;
-                Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), exec_tx.clone())) as Box<dyn Module>
+                Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), event_tx.clone())) as Box<dyn Module>
             }
+            crate::config::ModuleSpec::Applications => Box::new(Applications::new()) as Box<dyn Module>,
         })
         .collect()
 }
@@ -137,22 +132,44 @@ pub fn layout(widths: &SectionWidths, output_w: i32, theme: &Theme) -> BarLayout
     BarLayout { left, center, right }
 }
 
+/// The width of a module's visual units; application chips are square and every pair takes one `spacing` gap.
+pub fn spans_width(spans: &[Span], text: &mut TextEngine, theme: &Theme) -> i32 {
+    if spans.is_empty() {
+        return 0;
+    }
+    let width: i32 = spans
+        .iter()
+        .map(|span| if span.badge.is_some() { theme.app_icon } else { text.measure(&span.text, &theme.font).0.ceil() as i32 })
+        .sum();
+    width + theme.spacing.max(0) * (spans.len() as i32 - 1)
+}
+
 /// Module text wider than the available space is truncated so it never crosses into a neighbouring section.
+/// An application chip is never truncated: a half chip is worse than a missing one.
 pub fn fit_text(spans: &[Span], avail: i32, text: &mut TextEngine, theme: &Theme) -> Vec<Span> {
     let mut out = Vec::new();
     let mut left = avail.max(0) as f32;
-    for s in spans {
+    let gap = theme.spacing.max(0) as f32;
+    for (index, span) in spans.iter().enumerate() {
+        if index > 0 { left -= gap; }
         if left <= 0.0 { break; }
-        let (w, _) = text.measure(&s.text, &theme.font);
-        if w <= left {
-            left -= w;
-            out.push(s.clone());
+        if span.badge.is_some() {
+            let width = theme.app_icon as f32;
+            if width > left { break; }
+            left -= width;
+            out.push(span.clone());
         } else {
-            let mut s2 = s.clone();
-            let mut measure = |t: &str| text.measure(t, &theme.font).0;
-            s2.text = truncate_to_width(&s.text, left, &mut measure);
-            left = 0.0;
-            if !s2.text.is_empty() { out.push(s2); }
+            let (width, _) = text.measure(&span.text, &theme.font);
+            if width <= left {
+                left -= width;
+                out.push(span.clone());
+            } else {
+                let mut clipped = span.clone();
+                let mut measure = |value: &str| text.measure(value, &theme.font).0;
+                clipped.text = truncate_to_width(&span.text, left, &mut measure);
+                if !clipped.text.is_empty() { out.push(clipped); }
+                break;
+            }
         }
     }
     out
@@ -190,11 +207,28 @@ mod tests {
     #[test]
     fn notification_config_does_not_enter_bar_layout() {
         let cfg = crate::config::parse("[notification]\nposition = \"center\"\n[bar.right]\nmodules = [ { kind = \"clock\", format = \"%H\" } ]\n").unwrap();
-        let (mut sections, _rx) = Sections::from_config(&cfg);
+        let (mut sections, _rx, _tx) = Sections::from_config(&cfg);
         let theme = Theme::defaults(30);
         let widths = sections.widths(&mut TextEngine::new(), &theme);
         assert_eq!(widths.right.len(), 1);
         assert!(widths.right[0] > 0);
+    }
+
+    #[test]
+    fn application_chips_keep_their_width_and_take_a_gap() {
+        let theme = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        let chip = Span::application("F", 2);
+        assert_eq!(spans_width(std::slice::from_ref(&chip), &mut text, &theme), theme.app_icon);
+        let text_width = text.measure("x", &theme.font).0.ceil() as i32;
+        assert_eq!(spans_width(&[chip, Span::text("x")], &mut text, &theme), theme.app_icon + theme.spacing + text_width);
+    }
+
+    #[test]
+    fn fit_text_drops_a_chip_that_does_not_fit_instead_of_truncating_it() {
+        let theme = Theme::defaults(30);
+        let mut text = TextEngine::new();
+        assert!(fit_text(&[Span::application("F", 2)], 2, &mut text, &theme).is_empty());
     }
 
     #[test]

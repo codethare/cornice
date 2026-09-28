@@ -58,6 +58,9 @@ modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
   # 1-minute load average:
   { kind = "exec", command = "while true; do awk '{print int($1)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
+  # Open applications grouped by app_id; the module can be placed in any of the three lists.
+  # The compositor only reports app_id/title, so cornice shows a monogram chip with the window count.
+  { kind = "applications" },
 ]
 
 [notification]

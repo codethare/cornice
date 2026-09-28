@@ -33,16 +33,24 @@ The design doc is the only authority: `docs/superpowers/specs/2026-09-19-cornice
 | `geom.rs` | `Rect` / `Color` primitives. Alpha passes straight through; only `to_shm_bytes` premultiplies |
 | `canvas.rs` | Writing and clipping on a `wl_shm` byte buffer, including the continuous (superellipse) corner curve. Does not know about text |
 | `text.rs` | cosmic-text wrapper + clipping by width. Does not know about layout |
-| `widget.rs` | `Span` / `Action` / `Event` / `Module` primitives. Kept because design §5 mandates them |
+| `widget.rs` | `Span` / `Action` / `Event` / `Module` / `Toplevel` primitives. Kept because design §5 mandates them |
 | `theme.rs` | Colours and derived proportions |
 | `config.rs` | TOML schema, validation, errors with line numbers. Does not know about rendering |
 | `anim.rs` | Easing and tweening. No keyframes, no physics |
 | `bar/mod.rs` | Left/centre/right layout and `BarLayout`. Does not draw text |
-| `bar/modules.rs` | `clock` / `exec` |
+| `bar/modules.rs` | `clock` / `exec` / `applications` |
 | `notify/queue.rs` | Notification state machine. Touches neither D-Bus nor rendering |
 | `notify/service.rs` | zbus interface and signals. Does not touch rendering |
 | `notify/view.rs` | Card layout, drawing, hit testing. Does not touch the protocol |
-| `wayland/mod.rs` | The only place that holds `State` and the protocol callbacks. No Wayland types may appear in any other file |
+| `wayland/mod.rs` | The only place that holds `State` and the protocol callbacks, including the `foreign_toplevel_list` snapshot. No Wayland types may appear in any other file |
+
+## Applications module
+
+- The compositor reports toplevels through `ext-foreign-toplevel-list-v1`; sctk exposes it as `foreign_toplevel_list` and re-exports the protocol types from `reexports::protocols`, so no Cargo dependency is added.
+- `bar/modules.rs::Applications` is pure logic: it groups `app_id`s, sorts them, and returns one `Span::application(monogram, count)` per app. The module may sit in any of the three lists.
+- A chip is `app_icon = min(clamp(3 × height / 5, 1, 32), height)` square; the count is drawn at the chip's bottom-right at `app_icon / 3` and only when the count is greater than one.
+- Real image icons are out of scope: neither the protocol nor the dependency set can decode one.
+
 
 ## Style
 

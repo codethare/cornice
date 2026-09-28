@@ -28,6 +28,8 @@ pub struct Theme {
     pub height: i32,
     pub padding: i32,
     pub spacing: i32,
+    /// Square application-chip size derived from the bar height.
+    pub app_icon: i32,
     /// Gap between notification cards, default height/5
     pub card_gap: i32,
     /// Notification card padding, default height/2
@@ -44,6 +46,16 @@ impl Theme {
         Color::rgba(self.background.r, self.background.g, self.background.b, alpha as u8)
     }
 
+    /// Subtle fill behind an application monogram so the chip reads against any bar opacity.
+    pub fn app_icon_background(&self) -> Color {
+        Color::rgba(self.foreground.r, self.foreground.g, self.foreground.b, 0x2e)
+    }
+
+    /// The window-count badge: one third of the chip, so it sits in the corner without competing with the monogram.
+    pub fn app_badge_style(&self) -> TextStyle {
+        TextStyle::new((self.app_icon / 3).max(1) as f32, self.font.family.clone())
+    }
+
     /// A short desktop banner still needs enough vertical room for one balanced line.
     pub fn card_min_h(&self) -> i32 {
         let line = (self.font.size * 1.35).ceil() as i32;
@@ -52,6 +64,9 @@ impl Theme {
 
     pub fn defaults(height: i32) -> Self {
         let foreground = Color::rgba(0xdc, 0xdc, 0xdc, 0xff);
+        // 3/5 of the bar height is the usual icon-to-bar optical ratio; cap it so a very tall bar
+        // does not create an oversized chip, and never exceed the bar itself.
+        let app_icon = ((height * 3 / 5).clamp(1, 32)).min(height.max(1));
         Self {
             background: Color::rgba(0x1a, 0x1a, 0x1a, 0xee),
             bar_transparency: 0,
@@ -62,6 +77,7 @@ impl Theme {
             height,
             padding: 8,
             spacing: 6,
+            app_icon,
             card_gap: (height / 5).max(2),
             card_padding: (height / 2).max(4),
             card_w: (CARD_W_PER_HEIGHT * height).clamp(MIN_CARD_W, MAX_CARD_W),
@@ -111,6 +127,16 @@ mod tests {
 
         theme.bar_transparency = 100;
         assert_eq!(theme.bar_background().a, 0);
+    }
+
+    #[test]
+    fn application_chip_proportions_are_derived_from_height() {
+        let theme = Theme::defaults(30);
+        assert_eq!(theme.app_icon, 18);
+        assert_eq!(theme.app_badge_style().size, 6.0);
+        assert_ne!(theme.app_icon_background().a, 0);
+        assert_eq!(Theme::defaults(1).app_icon, 1);
+        assert_eq!(Theme::defaults(256).app_icon, 32);
     }
 
     #[test]

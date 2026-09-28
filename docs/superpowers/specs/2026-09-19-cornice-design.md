@@ -1,11 +1,11 @@
 # cornice 设计文档
 
-日期:2026-09-25(v8 — bar 背景透明度可配)
-状态:已确认(通知为 bar 外的独立卡片列;bar 固定为直角)
+日期:2026-09-25(v9 — applications 模块)
+状态:已确认(通知为 bar 外的独立卡片列;bar 固定为直角;应用显示使用 monogram 与数量角标)
 
 ## 1. 目标
 
-一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。bar 与 swaybar / i3bar 一样使用完整直角矩形,不做胶囊或圆角端部;背景透明度可在 0–100% 之间调节。
+一个 Linux/Wayland 状态栏,用 Rust 写,单进程内同时提供 `org.freedesktop.Notifications` 通知守护进程。视觉目标:简介、优雅、一致。bar 与 swaybar / i3bar 一样使用完整直角矩形,不做胶囊或圆角端部;背景透明度可在 0–100% 之间调节。已打开的应用显示为按 `app_id` 分组的 monogram chip,窗口数大于 1 时在右下角显示数量角标。
 
 通知不再插入 bar 的某个模块槽位,也不再从 bar 材质向下拉伸。通知显示在 bar 外侧下方,每条通知是一张独立卡片;多条通知按新 → 旧纵向排列,整列可以锚定在屏幕左上、中上或右上。卡片形状、间距、材质和动效参考 macOS 27 Golden Gate 的 Liquid Glass 设计语言,但使用 cornice 自己的比例和纯软件渲染能力。
 
@@ -16,6 +16,7 @@
 - `body-markup`、声音、DND 开关、通知历史中心
 - GPU 渲染、实时模糊、折射滤镜或阴影
 - 插件系统、布局语言、多个通知列
+- 真实应用图标:协议和当前 9 个依赖都没有 icon 像素或图像解码器;apps 模块只用 `app_id` 派生 monogram
 - macOS 品牌资产或逐像素复刻
 
 ## 2. 已验证的前提
@@ -113,6 +114,7 @@ modules = []
 [bar.right]
 modules = [
   { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
+  { kind = "applications" },
 ]
 
 [notification]
@@ -133,7 +135,7 @@ bar 没有圆角配置:背景直接用 `fill_rect` 铺满 surface,左右内容�
 - `position` 只接受 `left`、`center`、`right`;其他值在解析层报错并带位置。
 - 旧的 `{ kind = "notification" }` bar 模块被删除,不再兼容;它会作为未知 module kind 报错。
 
-bar 的三个 module 列表只包含 `clock` 与 `exec`。通知卡片是否存在、位于哪里,完全由 `[notification]` 决定。
+bar 的三个 module 列表可以包含 `clock`、`exec` 与 `applications`。通知卡片是否存在、位于哪里,完全由 `[notification]` 决定。
 
 ## 5. bar 契约
 
@@ -143,7 +145,10 @@ struct Span {
     color: Option<Color>,
     bg: Option<Color>,
     action: Option<Action>,
+    badge: Option<u32>,
 }
+
+struct Toplevel { app_id: String }
 
 trait Module {
     fn update(&mut self, ev: &Event) -> bool;
@@ -156,6 +161,16 @@ trait Module {
 - 三者重叠时 center 优先,两侧模块按可用宽度截断。
 - 模块之间使用 `bar.spacing`;没有通知模块,因此通知出现和消失不会改变 bar 内任何模块的位置。
 - 文本按 cap height 定位,字体度量由首帧光学校正并缓存。
+
+### applications 模块
+
+- 数据来自 `ext-foreign-toplevel-list-v1`;cornice 通过 sctk 的 `foreign_toplevel_list` 和 `reexports::protocols` 使用它,不新增任何 crate。
+- 协议只提供 `app_id` 与 title;river 未广告该 global 时模块为空,不影响 bar 与通知守护进程。
+- 按 `app_id` 分组并按 `app_id` 排序;空 `app_id` 不显示。
+- 每个应用一个正方形 chip:monogram 取 `app_id` 最后一段的首字母,chip 边长 `app_icon = min(clamp(3 × height / 5, 1, 32), height)`。
+- 窗口数 > 1 时,在 chip 右下角用 `app_icon / 3` 的字号绘制数量;数量为 1 时不画角标。角标按 chip 内宽裁剪。
+- chip 之间使用 `bar.spacing`;模块可以放在 left / center / right 任意一个列表。
+- 真实图像图标需要新增图像解码依赖,不在当前范围内。
 
 ## 6. 通知语义
 
@@ -246,16 +261,16 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 | `geom.rs` | `Rect` / `Color`;alpha 透传,只在 `to_shm_bytes` 预乘 |
 | `canvas.rs` | `wl_shm` 写入、裁剪、连续圆角;不知道文字 |
 | `text.rs` | cosmic-text、宽度裁剪;不知道布局 |
-| `widget.rs` | `Span` / `Action` / `Event` / `Module` |
-| `theme.rs` | 颜色与由 height 派生的比例 |
+| `widget.rs` | `Span` / `Action` / `Event` / `Module` / `Toplevel` |
+| `theme.rs` | 颜色与由 height 派生的比例,包括 apps chip |
 | `config.rs` | TOML schema、`[notification].position`、解析与行号错误 |
 | `anim.rs` | `Easing` / `Tween`;不持有协议或布局 |
 | `bar/mod.rs` | 左/中/右布局;不绘制通知 |
-| `bar/modules.rs` | `clock` / `exec` |
+| `bar/modules.rs` | `clock` / `exec` / `applications`(分组与 monogram 纯逻辑) |
 | `notify/queue.rs` | 通知状态机;不碰 D-Bus 或渲染 |
 | `notify/service.rs` | zbus 接口和信号 |
 | `notify/view.rs` | 独立卡片尺寸、列位置、动画插值、绘制和命中 |
-| `wayland/mod.rs` | 唯一持有 `State` 和 Wayland 回调;每卡 surface 生命周期与 timer |
+| `wayland/mod.rs` | 唯一持有 `State` 和 Wayland 回调;每卡 surface 生命周期、foreign toplevel 快照与 timer |
 
 ## 11. 测试与手动验证
 
@@ -270,6 +285,7 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 - 不可信字段/body/action 裁剪,action 命中矩形不越界
 - 入场/退场端点、alpha/scale 单调性、完成判断、逐卡独立性
 - 队列替换、可见窗口、容量、超时、关闭原因
+- applications 分组、排序、空 app_id、monogram、数量角标、chip 宽度与图片不截断
 - `Rect` / canvas / 文本既有纯逻辑回归
 
 协议和像素层不做自动化断言,按 `docs/smoke.md` 手动检查。
@@ -281,6 +297,8 @@ card[i+1].top = card[i].top + card[i].height + card_gap
 - 多条通知新 → 旧纵向排列,每张有独立背景、连续圆角、间距和点击区域。
 - `left` / `center` / `right` 三种位置整列对齐正确,透明区域点击穿透。
 - 入场和退场 spring 可见且不造成文本跳闪;关闭一条后其余卡平滑补位。
+- river 广告 `ext_foreign_toplevel_list_v1` 时,打开/关闭窗口会让对应 monogram chip 出现/消失;同一 app_id 开三个窗口时右下角显示 `3`,只开一个时不显示角标。
+- 将 `{ kind = "applications" }` 放到 left / center / right 的任一个 module 列表,chip 按该区域对齐;未广告协议时 bar 不报错、不占位。
 - 退场/透明区域不吞点击;action 优先于主体关闭。
 - 首个 configure 前没有 buffer,没有 `wl_surface` 协议错误。
 - river + tailrace 下每张通知路由到焦点 output,输出移除后能重建。
