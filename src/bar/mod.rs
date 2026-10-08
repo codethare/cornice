@@ -4,9 +4,9 @@ pub mod modules;
 
 use crate::config::Config;
 use crate::geom::Rect;
-use crate::text::{truncate_to_width, TextEngine};
+use crate::text::TextEngine;
 use crate::theme::Theme;
-use crate::widget::{Event, Module, Span};
+use crate::widget::{Event, Module, ModuleActions, Span};
 
 pub use modules::{Applications, Clock, Exec};
 
@@ -14,6 +14,12 @@ pub struct Sections {
     pub left: Vec<Box<dyn Module>>,
     pub center: Vec<Box<dyn Module>>,
     pub right: Vec<Box<dyn Module>>,
+    /// Parallel to the three module lists: the click and wheel commands of each module, same order.
+    pub left_actions: Vec<ModuleActions>,
+    pub center_actions: Vec<ModuleActions>,
+    pub right_actions: Vec<ModuleActions>,
+    /// Whether any module wants a periodic tick; without one the idle timer is never armed.
+    pub has_clock: bool,
 }
 
 impl Sections {
@@ -24,7 +30,27 @@ impl Sections {
         let left = build(&cfg.bar.left, &mut exec_id, &event_tx);
         let center = build(&cfg.bar.center, &mut exec_id, &event_tx);
         let right = build(&cfg.bar.right, &mut exec_id, &event_tx);
-        (Self { left, center, right }, event_rx, event_tx)
+        let actions = |specs: &[crate::config::ModuleSpec]| specs.iter().map(crate::config::ModuleSpec::actions).collect();
+        let has_clock = cfg
+            .bar
+            .left
+            .iter()
+            .chain(cfg.bar.center.iter())
+            .chain(cfg.bar.right.iter())
+            .any(|spec| matches!(spec, crate::config::ModuleSpec::Clock { .. }));
+        (
+            Self {
+                left,
+                center,
+                right,
+                left_actions: actions(&cfg.bar.left),
+                center_actions: actions(&cfg.bar.center),
+                right_actions: actions(&cfg.bar.right),
+                has_clock,
+            },
+            event_rx,
+            event_tx,
+        )
     }
 
     pub fn update(&mut self, ev: &Event) -> bool {
@@ -52,12 +78,12 @@ fn build(specs: &[crate::config::ModuleSpec], exec_id: &mut usize, event_tx: &ca
     specs
         .iter()
         .map(|spec| match spec {
-            crate::config::ModuleSpec::Clock { format } => Box::new(Clock::new(format.clone())) as Box<dyn Module>,
-            crate::config::ModuleSpec::Exec { command, format } => {
+            crate::config::ModuleSpec::Clock { format, .. } => Box::new(Clock::new(format.clone())) as Box<dyn Module>,
+            crate::config::ModuleSpec::Exec { command, format, interval, .. } => {
                 *exec_id += 1;
-                Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), event_tx.clone())) as Box<dyn Module>
+                Box::new(Exec::spawn(*exec_id, command.clone(), format.clone(), *interval, event_tx.clone())) as Box<dyn Module>
             }
-            crate::config::ModuleSpec::Applications => Box::new(Applications::new()) as Box<dyn Module>,
+            crate::config::ModuleSpec::Applications { .. } => Box::new(Applications::new()) as Box<dyn Module>,
         })
         .collect()
 }
@@ -165,8 +191,7 @@ pub fn fit_text(spans: &[Span], avail: i32, text: &mut TextEngine, theme: &Theme
                 out.push(span.clone());
             } else {
                 let mut clipped = span.clone();
-                let mut measure = |value: &str| text.measure(value, &theme.font).0;
-                clipped.text = truncate_to_width(&span.text, left, &mut measure);
+                clipped.text = text.fit_text(&span.text, &theme.font, left);
                 if !clipped.text.is_empty() { out.push(clipped); }
                 break;
             }
@@ -218,7 +243,7 @@ mod tests {
     fn application_chips_keep_their_width_and_take_a_gap() {
         let theme = Theme::defaults(30);
         let mut text = TextEngine::new();
-        let chip = Span::application("F", 2);
+        let chip = Span::application("F", 2, false);
         assert_eq!(spans_width(std::slice::from_ref(&chip), &mut text, &theme), theme.app_icon);
         let text_width = text.measure("x", &theme.font).0.ceil() as i32;
         assert_eq!(spans_width(&[chip, Span::text("x")], &mut text, &theme), theme.app_icon + theme.spacing + text_width);
@@ -228,7 +253,7 @@ mod tests {
     fn fit_text_drops_a_chip_that_does_not_fit_instead_of_truncating_it() {
         let theme = Theme::defaults(30);
         let mut text = TextEngine::new();
-        assert!(fit_text(&[Span::application("F", 2)], 2, &mut text, &theme).is_empty());
+        assert!(fit_text(&[Span::application("F", 2, false)], 2, &mut text, &theme).is_empty());
     }
 
     #[test]

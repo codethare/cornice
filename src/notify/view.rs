@@ -35,7 +35,11 @@ fn headline_rule(theme: &Theme, cap: f32, summary: i32, line: i32, source_x: i32
 
 fn body_lines(n: &Notification) -> usize { if n.body.is_empty() { 0 } else { n.body.lines().count().min(crate::notify::queue::MAX_BODY_LINES) } }
 fn first_line(text: &str) -> &str { text.lines().next().unwrap_or("") }
-fn has_actions(n: &Notification) -> bool { n.actions.iter().any(|(_, label)| !first_line(label).trim().is_empty()) }
+fn has_actions(n: &Notification) -> bool { n.actions.iter().any(|(key, label)| key != "default" && !first_line(label).trim().is_empty()) }
+
+/// `default` is the way a client says "clicking the notification itself should do this"; without one the
+/// body click only dismisses.
+pub fn has_default_action(n: &Notification) -> bool { n.actions.iter().any(|(key, _)| key == "default") }
 
 pub fn top_margin(theme: &Theme, bar_margin: i32) -> i32 { bar_margin + theme.height + theme.card_gap }
 pub fn surface_top(theme: &Theme, bar_margin: i32, card_top: i32) -> i32 { top_margin(theme, bar_margin) + card_top }
@@ -178,13 +182,13 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, notification: &Notif
     let inner_w = (right - x).max(0) as f32;
 
     let source = first_line(notification.app_name.trim());
-    let source = crate::text::truncate_to_width(source, inner_w / 3.0, |value| text.measure(value, &theme.font).0);
+    let source = text.fit_text(source, &theme.font, inner_w / 3.0);
     let cap = text.cap_metrics(&theme.font).cap;
     let source_w = if source.is_empty() { 0 } else { text.measure(&source, &theme.font).0.ceil() as i32 };
     let source_x = right - source_w;
     let rule = if source.is_empty() { None } else { Some(headline_rule(theme, cap, card.summary, line, source_x)) };
     let summary_w = match rule { Some(rule) => (rule.x - theme.card_gap / 2 - x).max(0) as f32, None => inner_w };
-    let summary = crate::text::truncate_to_width(first_line(&notification.summary), summary_w, |value| text.measure(value, &theme.font).0);
+    let summary = text.fit_text(first_line(&notification.summary), &theme.font, summary_w);
     let summary_y = text.optical_top(&theme.font, card.summary, line);
     text.draw(canvas, &summary, x, summary_y, &theme.font, fa(urgency_color(notification.urgency, theme)));
     if !source.is_empty() { text.draw(canvas, &source, source_x, summary_y, &theme.font, fa(theme.secondary)); }
@@ -195,7 +199,7 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, notification: &Notif
     }
     if let Some(mut y) = card.body {
         for body_line in notification.body.lines().take(crate::notify::queue::MAX_BODY_LINES) {
-            let body = crate::text::truncate_to_width(body_line, inner_w, |value| text.measure(value, &theme.font).0);
+            let body = text.fit_text(body_line, &theme.font, inner_w);
             text.draw(canvas, &body, x, y, &theme.font, fa(theme.secondary));
             y += line;
         }
@@ -207,11 +211,16 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, notification: &Notif
         let fill = Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, (theme.accent.a as u16 * ACTION_FILL_PERCENT / 100) as u8);
         let mut bx = x;
         for (key, label) in &notification.actions {
+            // `default` is the notification's own action, fired by clicking the card body; a pill for it
+            // would be a second, redundant target for the same thing.
+            if key == "default" {
+                continue;
+            }
             let label = first_line(label).trim();
             let available = right - bx;
             if label.is_empty() { continue; }
             if available < line + action_pad * 2 { break; }
-            let label = crate::text::truncate_to_width(label, (available - action_pad * 2) as f32, |value| text.measure(value, &theme.font).0);
+            let label = text.fit_text(label, &theme.font, (available - action_pad * 2) as f32);
             let label_w = text.measure(&label, &theme.font).0.ceil() as i32;
             let button = Rect::new(bx, ay, (label_w + action_pad * 2).min(available), line);
             canvas.fill_rounded_rect(button, line / 2, fill);
@@ -357,13 +366,30 @@ mod tests {
     }
 
     #[test]
+    fn the_default_action_takes_no_button_row() {
+        let theme = Theme::defaults(30);
+        let mut notification = note(1, "Subject", "body");
+        notification.actions = vec![("default".into(), "Open".into())];
+        assert!(has_default_action(&notification));
+        let card = cards(&[notification.clone()], &theme).remove(0);
+        assert_eq!(card.actions, None, "`default` is fired by the body, so it must not reserve a row");
+        let mut buffer = vec![0u8; (card.rect.w * card.rect.h * 4) as usize];
+        let hits = {
+            let mut canvas = Canvas::new(&mut buffer, card.rect.w, card.rect.h);
+            canvas.set_clip(Some(card.rect));
+            render(&mut canvas, &card, 1.0, &notification, &theme, &mut TextEngine::new())
+        };
+        assert!(hits.is_empty(), "no pill should be drawn for `default`: {hits:?}");
+    }
+
+    #[test]
     fn hit_testing_matches_buttons_only() {
         let hits = vec![
             (Rect::new(10, 10, 50, 20), Action::NotificationAction { id: 1, key: "open".into() }),
-            (Rect::new(70, 10, 50, 20), Action::NotificationClose(1)),
+            (Rect::new(70, 10, 50, 20), Action::NotificationBody(1)),
         ];
         assert_eq!(hit(&hits, 20, 15), Some(Action::NotificationAction { id: 1, key: "open".into() }));
-        assert_eq!(hit(&hits, 80, 15), Some(Action::NotificationClose(1)));
+        assert_eq!(hit(&hits, 80, 15), Some(Action::NotificationBody(1)));
         assert_eq!(hit(&hits, 200, 15), None);
     }
 }

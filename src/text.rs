@@ -38,13 +38,15 @@ pub struct TextEngine {
     /// Measured once per (family, size): rasterising `H` is the only reliable way to learn the ink
     /// offsets, and it is done on the first frame that needs them.
     cap_cache: HashMap<(String, u32), CapMetrics>,
+    /// Advance width of `…` per (family, size); every truncated string needs it.
+    ellipsis_cache: HashMap<(String, u32), f32>,
 }
 
 impl Default for TextEngine { fn default() -> Self { Self::new() } }
 
 impl TextEngine {
     pub fn new() -> Self {
-        Self { font_system: FontSystem::new(), swash_cache: SwashCache::new(), cap_cache: HashMap::new() }
+        Self { font_system: FontSystem::new(), swash_cache: SwashCache::new(), cap_cache: HashMap::new(), ellipsis_cache: HashMap::new() }
     }
 
     /// Rasterise a single `H` into a scratch canvas and read the ink rows back out.
@@ -92,6 +94,16 @@ impl TextEngine {
         let m = self.cap_metrics(style);
         let centre = box_y as f32 + box_h as f32 / 2.0;
         (centre - m.cap / 2.0 - m.top).round() as i32
+    }
+
+    fn ellipsis_width(&mut self, style: &TextStyle) -> f32 {
+        let key = (style.family.clone(), style.size.to_bits());
+        if let Some(width) = self.ellipsis_cache.get(&key) {
+            return *width;
+        }
+        let width = self.measure("…", style).0;
+        self.ellipsis_cache.insert(key, width);
+        width
     }
 
     /// The returned `Attrs` borrows `style` rather than self — otherwise it would hold an immutable borrow of self until
@@ -149,60 +161,91 @@ impl TextEngine {
             canvas.fill_rect(crate::geom::Rect::new(x + gx, baseline + gy, gw as i32, gh as i32), c);
         });
     }
-}
 
-/// Chops characters off the end and appends `…` when too wide; the measure function is injected for unit tests.
-pub fn truncate_to_width(text: &str, max_w: f32, mut measure: impl FnMut(&str) -> f32) -> String {
+    /// Chops characters off the end and appends `…` when too wide. One shaping pass, then the glyph
+    /// x positions decide the cut: re-shaping every candidate string (the obvious loop) costs ~8 ms per
+    /// notification card per frame, and an enter animation draws every frame.
+    pub fn fit_text(&mut self, text: &str, style: &TextStyle, max_w: f32) -> String {
     if text.is_empty() || max_w <= 0.0 {
         return String::new();
     }
-    if measure(text) <= max_w {
-        return text.to_string();
+    // Measured before the buffer exists: `borrow_with` holds a mutable borrow of the font system.
+    let ellipsis = self.ellipsis_width(style);
+    let budget = max_w - ellipsis;
+    if budget <= 0.0 {
+        return if ellipsis <= max_w { "…".to_string() } else { String::new() };
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut end = chars.len();
-    while end > 0 {
-        end -= 1;
-        let candidate: String = chars[..end].iter().collect::<String>() + "…";
-        if measure(&candidate) <= max_w {
-            return candidate;
+    let line = Self::line_height(style);
+    let attrs = Self::attrs(style);
+    let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(style.size, line));
+    let mut buffer = buffer.borrow_with(&mut self.font_system);
+    buffer.set_size(None, None);
+    buffer.set_text(text, &attrs, Shaping::Advanced, None);
+
+    let mut cut = text.len();
+    let mut over = false;
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            if glyph.x + glyph.w > budget {
+                cut = glyph.start;
+                over = true;
+                break;
+            }
+        }
+        if over {
+            break;
         }
     }
-    String::new()
+    if !over {
+        return text.to_string();
+    }
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_string();
+    out.push('…');
+    out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A fake measure function that counts every char as 10px wide, decoupling truncation logic from fonts.
-    fn fake(text: &str) -> f32 { text.chars().count() as f32 * 10.0 }
+    fn engine() -> (TextEngine, TextStyle) { (TextEngine::new(), TextStyle::new(11.0, "monospace")) }
 
     #[test]
-    fn truncate_keeps_short_text() {
-        assert_eq!(truncate_to_width("abc", 100.0, fake), "abc");
-        assert_eq!(truncate_to_width("abc", 30.0, fake), "abc");
+    fn short_text_is_returned_unchanged() {
+        let (mut e, style) = engine();
+        assert_eq!(e.fit_text("abc", &style, 100.0), "abc");
+        assert_eq!(e.fit_text("", &style, 100.0), "");
+        assert_eq!(e.fit_text("abc", &style, 0.0), "");
     }
 
     #[test]
-    fn truncate_adds_ellipsis_within_budget() {
-        let out = truncate_to_width("abcdefghij", 35.0, fake);
+    fn long_text_is_cut_to_the_width_with_an_ellipsis() {
+        let (mut e, style) = engine();
+        let long = "abcdefghij".repeat(6);
+        let budget = 60.0;
+        let out = e.fit_text(&long, &style, budget);
         assert!(out.ends_with('…'), "{out}");
-        assert!(fake(&out) <= 35.0, "{out} width {}", fake(&out));
-        assert_eq!(out, "ab…");
+        assert!(out.len() < long.len(), "{out}");
+        assert!(long.starts_with(out.trim_end_matches('…')), "the kept prefix must be a prefix: {out}");
+        assert!(e.measure(&out, &style).0 <= budget, "{out} is wider than {budget}");
     }
 
     #[test]
-    fn truncate_degenerate_budget() {
-        assert_eq!(truncate_to_width("abcdef", 0.0, fake), "");
-        assert_eq!(truncate_to_width("", 50.0, fake), "");
+    fn a_budget_smaller_than_the_ellipsis_still_returns_what_fits() {
+        let (mut e, style) = engine();
+        let ellipsis = e.measure("…", &style).0;
+        assert_eq!(e.fit_text("abcdef", &style, ellipsis - 0.5), "");
+        assert_eq!(e.fit_text("abcdef", &style, ellipsis + 0.5), "…");
     }
 
     /// The point of the cap metrics: whatever the font, the *ink* ends up centred in the box.
     #[test]
     fn optical_top_centres_the_cap_height() {
-        let mut e = TextEngine::new();
-        let style = TextStyle::new(11.0, "monospace");
+        let (mut e, style) = engine();
         let m = e.cap_metrics(&style);
         assert!(m.cap > 0.0, "a cap height must be measurable: {m:?}");
         for box_h in [16, 30, 40] {
@@ -216,6 +259,5 @@ mod tests {
             );
         }
     }
-
 }
 

@@ -8,6 +8,7 @@ use toml::Spanned;
 
 use crate::geom::Color;
 use crate::theme::{parse_font, Theme};
+use crate::widget::ModuleActions;
 
 #[derive(Clone)]
 pub struct Config { pub bar: Bar, pub theme: Theme, pub notification: Option<Notification> }
@@ -28,6 +29,8 @@ impl fmt::Debug for Config {
 pub struct Bar {
     pub height: i32,
     pub margin: i32,
+    /// Outputs this bar is created on, by `wl_output` name. Empty means every output.
+    pub outputs: Vec<String>,
     pub left: Vec<ModuleSpec>,
     pub center: Vec<ModuleSpec>,
     pub right: Vec<ModuleSpec>,
@@ -36,10 +39,52 @@ pub struct Bar {
 #[derive(Clone, Deserialize, PartialEq, Debug)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ModuleSpec {
-    Clock { #[serde(default = "default_clock_format")] format: String },
-    Exec { command: String, #[serde(default)] format: String },
+    Clock {
+        #[serde(default = "default_clock_format")]
+        format: String,
+        on_click: Option<String>,
+        on_scroll_up: Option<String>,
+        on_scroll_down: Option<String>,
+    },
+    Exec {
+        command: String,
+        #[serde(default)]
+        format: String,
+        /// Re-run `command` every `interval` milliseconds; without it the command is a resident child
+        /// whose stdout lines are read as they arrive.
+        interval: Option<u64>,
+        on_click: Option<String>,
+        on_scroll_up: Option<String>,
+        on_scroll_down: Option<String>,
+    },
     /// Open applications grouped by `app_id`, rendered as monogram chips with a window-count badge.
-    Applications,
+    Applications { on_click: Option<String>, on_scroll_up: Option<String>, on_scroll_down: Option<String> },
+}
+
+impl ModuleSpec {
+    pub fn actions(&self) -> ModuleActions {
+        let (on_click, on_scroll_up, on_scroll_down) = match self {
+            ModuleSpec::Clock { on_click, on_scroll_up, on_scroll_down, .. }
+            | ModuleSpec::Exec { on_click, on_scroll_up, on_scroll_down, .. }
+            | ModuleSpec::Applications { on_click, on_scroll_up, on_scroll_down } => (on_click, on_scroll_up, on_scroll_down),
+        };
+        ModuleActions {
+            on_click: command(on_click),
+            on_scroll_up: command(on_scroll_up),
+            on_scroll_down: command(on_scroll_down),
+        }
+    }
+}
+
+/// Whether a bar belongs on the output with this name. An empty list means every output, and a name that has
+/// not arrived yet — or that this compositor never sends — matches: an unknown name must not mean no bar at all.
+pub fn output_matches(names: &[String], name: Option<&str>) -> bool {
+    names.is_empty() || name.is_none_or(|name| names.iter().any(|wanted| wanted == name))
+}
+
+/// An empty command is the same as no command: `sh -c ""` would swallow the click and do nothing.
+fn command(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
 }
 
 fn default_clock_format() -> String { "%H:%M".to_string() }
@@ -61,6 +106,7 @@ struct RawBar {
     height: Option<Spanned<i32>>,
     background_transparency: Option<Spanned<i32>>,
     margin: Option<i32>, padding: Option<i32>, spacing: Option<i32>,
+    outputs: Vec<String>,
     left: RawSection, center: RawSection, right: RawSection,
 }
 
@@ -102,6 +148,8 @@ fn color_at(text: &str, key: &str, v: &Option<Spanned<String>>, fallback: Color)
 }
 
 const DEFAULT_HEIGHT: i32 = 30;
+/// Valid `exec.interval` range in milliseconds: 0 would respawn the child as fast as it can be reaped.
+const INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400_000;
 /// Valid bar height range in pixels. The upper bound is defensive: the value is also `layer.set_size`,
 /// input to each output's `SlotPool::new(width * height * 4)` and to the derived notification ratios,
 /// a mistyped number must not turn into a multi-terabyte allocation request.
@@ -129,7 +177,17 @@ fn bar_transparency_at(text: &str, value: &Option<Spanned<i32>>) -> Result<u8, S
     Ok(percent as u8)
 }
 
-fn modules_of(spanned: &[Spanned<ModuleSpec>]) -> Vec<ModuleSpec> { spanned.iter().map(|m| m.get_ref().clone()).collect() }
+fn modules_of(text: &str, spanned: &[Spanned<ModuleSpec>]) -> Result<Vec<ModuleSpec>, String> {
+    for spec in spanned {
+        if let ModuleSpec::Exec { interval: Some(interval), .. } = spec.get_ref()
+            && !INTERVAL_RANGE.contains(interval)
+        {
+            let (line, column) = line_col(text, spec.span().start);
+            return Err(format!("{line}:{column}: exec.interval: must be within {INTERVAL_RANGE:?} milliseconds, currently {interval}"));
+        }
+    }
+    Ok(spanned.iter().map(|spec| spec.get_ref().clone()).collect())
+}
 
 fn notification_position_at(text: &str, value: &Option<Spanned<String>>) -> Result<NotificationPosition, String> {
     let Some(value) = value else { return Ok(NotificationPosition::Right) };
@@ -173,9 +231,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         bar: Bar {
             height,
             margin: raw.bar.margin.unwrap_or(0),
-            left: modules_of(&raw.bar.left.modules),
-            center: modules_of(&raw.bar.center.modules),
-            right: modules_of(&raw.bar.right.modules),
+            outputs: raw.bar.outputs,
+            left: modules_of(text, &raw.bar.left.modules)?,
+            center: modules_of(text, &raw.bar.center.modules)?,
+            right: modules_of(text, &raw.bar.right.modules)?,
         },
         theme,
         notification,
@@ -260,7 +319,7 @@ max_visible = 3
         assert_eq!(c.bar.height, 30);
         assert_eq!(c.bar.margin, 0);
         assert_eq!(c.bar.right.len(), 3);
-        assert_eq!(c.bar.right[2], ModuleSpec::Applications);
+        assert!(matches!(c.bar.right[2], ModuleSpec::Applications { .. }));
         let notification = c.notification.as_ref().expect("the template enables notifications");
         assert_eq!(notification.position, NotificationPosition::Right);
         assert_eq!(notification.max_visible, 4);
@@ -370,5 +429,47 @@ max_visible = 3
         }
         // still defaults to 30 when the key is absent
         assert_eq!(parse("[bar]\n").unwrap().bar.height, 30);
+    }
+
+    #[test]
+    fn module_actions_are_optional_and_empty_commands_are_dropped() {
+        let c = parse(
+            "[bar.left]\nmodules = [\n  { kind = \"clock\", on_click = \"echo hi\", on_scroll_up = \"  \" },\n  { kind = \"applications\", on_scroll_down = \"true\" },\n]\n",
+        )
+        .unwrap();
+        let clock = c.bar.left[0].actions();
+        assert_eq!(clock.on_click.as_deref(), Some("echo hi"));
+        assert_eq!(clock.on_scroll_up, None, "a blank command is no command");
+        let apps = c.bar.left[1].actions();
+        assert_eq!(apps.on_scroll_down.as_deref(), Some("true"));
+        assert!(apps.any());
+        assert!(!parse("[bar.left]\nmodules = [ { kind = \"clock\" } ]\n").unwrap().bar.left[0].actions().any());
+    }
+
+    /// 0 would respawn the child as fast as it can be reaped, so it is rejected like any other range.
+    #[test]
+    fn exec_interval_must_be_at_least_one_millisecond() {
+        let c = parse("[bar.right]\nmodules = [ { kind = \"exec\", command = \"date\", interval = 2000 } ]\n").unwrap();
+        assert!(matches!(c.bar.right[0], ModuleSpec::Exec { interval: Some(2000), .. }));
+        let error = parse("[bar.right]\nmodules = [ { kind = \"exec\", command = \"date\", interval = 0 } ]\n").unwrap_err();
+        assert!(error.starts_with("2:"), "{error}");
+        assert!(error.contains("exec.interval"), "{error}");
+    }
+
+    #[test]
+    fn bar_outputs_default_to_every_output() {
+        assert!(parse("[bar]\n").unwrap().bar.outputs.is_empty());
+        let c = parse("[bar]\noutputs = [\"DP-1\", \"HDMI-A-1\"]\n").unwrap();
+        assert_eq!(c.bar.outputs, vec!["DP-1".to_string(), "HDMI-A-1".to_string()]);
+    }
+
+    #[test]
+    fn output_matching_never_drops_a_bar_over_an_unknown_name() {
+        let names = vec!["DP-1".to_string()];
+        assert!(output_matches(&[], Some("DP-1")));
+        assert!(output_matches(&[], Some("eDP-1")), "an empty list is every output");
+        assert!(output_matches(&names, Some("DP-1")));
+        assert!(!output_matches(&names, Some("eDP-1")));
+        assert!(output_matches(&names, None), "a name that has not arrived yet must not lose its bar");
     }
 }

@@ -1,7 +1,7 @@
 # cornice 设计文档
 
-日期:2026-09-25(v9 — applications 模块)
-状态:已确认(通知为 bar 外的独立卡片列;bar 固定为直角;应用显示使用 monogram 与数量角标)
+日期:2026-10-01(v10 — 聚焦高亮、模块点击、bar 显隐与输出选择、唤醒与重绘节流)
+状态:已确认(通知为 bar 外的独立卡片列;bar 固定为直角;应用显示使用 monogram 与数量角标;增量见 §14)
 
 ## 1. 目标
 
@@ -11,7 +11,7 @@
 
 ### 非目标
 
-- **tags / workspace / layout / mode / 聚焦窗口标题**(现代 river 不会向普通 bar 暴露这些状态,见 §2)
+- **tags / workspace / layout / mode / 聚焦窗口标题**(现代 river 不会向普通 bar 暴露这些状态,见 §2)。**焦点高亮是例外**:river 仍暴露窗口列表的 `activated` 状态,见 §14。
 - 图标 / 图片通知(`icon-static`、`image-path`、主题图标查找、PNG 解码)
 - `body-markup`、声音、DND 开关、通知历史中心
 - GPU 渲染、实时模糊、折射滤镜或阴影
@@ -28,6 +28,7 @@
 - 目标运行时是 river(≥0.4.6)+ tailrace;tailrace 在焦点 output 上设置 layer-shell default。
 - cornice 只使用标准 `wlr-layer-shell`。每张通知 surface 不指定 output,由 river + tailrace 选择当前焦点 output。
 - `river-window-management-v1` 只发给单个 WM 客户端。第三方 bar 结构性无法获得现代 river 的窗口状态,因此不实现任何 `river.*` 模块。
+- **例外:焦点。** river v0.4.6 与 v0.4.8 都仍创建已废弃的 wlroots `zwlr_foreign_toplevel_manager_v1`(`river/Server.zig:176`),并在其上发送 `app_id` 与 `activated`(`river/Window.zig:795-816`、`:1255-1270`);`Server.zig::globalFilter` 对普通客户端一律返回 true。因此聚焦应用的 `app_id` 可得,且不需要新依赖(sctk 已 `pub use wayland_protocols_wlr as protocols_wlr`)。该 global 缺失时必须静默降级为不高亮。
 
 来源:
 
@@ -332,3 +333,37 @@ cornice 使用 `KeyboardInteractivity::None`,结构上不能接收全局按键;�
 3. Wayland 每卡 surface、anchor、输入与 timer 接线。
 4. 更新模板、smoke 和本设计约束。
 5. `cargo fmt --check`,`cargo test`,`cargo build`。
+
+## 14. v10 增量
+
+### 聚焦高亮
+
+- `wayland/mod.rs` 绑定 `zwlr_foreign_toplevel_manager_v1`(版本 1..=3);global 缺失只打印一行提示,bar 照常运行。
+- 每个 handle 记录 `(app_id, activated)`;`activated` 来自 `state` 事件(`wl_array` 的 little-endian u32 值)。焦点变化只在真正变化时通过 `Event::FocusedApp(Option<String>)` 交给模块。
+- `Applications` 保存 focused `app_id`,对应 chip 用 `Theme::app_icon_focused_background()` 与 accent 文字。没有焦点源时不高亮。窗口列表与 `ext-foreign-toplevel-list-v1` 是两个独立输入,任一缺失都不影响另一个。
+
+### 模块点击与滚轮
+
+- `ModuleSpec` 的三种 kind 都可带 `on_click`(左键)、`on_scroll_up`、`on_scroll_down`,经 `ModuleSpec::actions()` 进入 `Sections::*_actions`。空白命令等于没有命令。
+- `draw_bar` 把有命令的模块 rect 写进 `Bar::hits`,并用同一份 rect 设置 bar 的 input region;没有命令的模块不在 region 里,所以 bar 空白区域点击穿透。命令经 `bar::modules::spawn_detached`(`sh -c`,stdio 丢弃,另起线程回收)执行,主循环不等待。
+- `exec` 新增 `interval`(1..=86400000 ms):按间隔重跑一次性命令;缺省仍是常驻子进程逐行读取。
+
+### bar 显隐与输出选择
+
+- `bar.outputs` 为空表示所有输出;`State::sync_bars()` 是唯一的 bar 增删入口,由 output 事件与显隐请求共同调用。名字未知的输出按“匹配”处理,名字到达后若不匹配再移除。
+- 控制面 `org.cornice.Control` 增加 `ToggleBar` 与 `SetBarVisible(bool)`;两个 well-known name(`org.freedesktop.Notifications`、`org.cornice.Control`)分别以 `DoNotQueue` 申请,被别人占用的那个只降级不退出,cornice 不再因为通知名被占而失去控制面。
+- CLI 增加 `cornice bar toggle | show | hide`。reload 仍是 `SIGUSR1` 原地重启,没有 D-Bus reload:方法回复与 `execv` 之间有竞态,不值得。
+
+### 唤醒、重绘与缓冲
+
+- 空闲定时器由 `ensure_idle_timer()` 按需武装,`next_wake()` 返回 `None` 时自毁:没有 `clock` 模块、没有待到期通知时不再每秒唤醒。
+- bar 重绘走 `bar_changed()`,以 `BAR_REDRAW_INTERVAL = 50 ms` 合流;通知动画仍由单个帧源以 16 ms 驱动。
+- 每张通知 surface 在 commit 前请求 `wl_surface.frame`,并记录未呈现的帧数;达到 `MAX_PENDING_FRAMES = 2` 且动画仍在进行时跳过光栅化,动画结束时必画最后一帧。
+- 文本裁剪改为 `TextEngine::fit_text`:一次 shaping 后按 glyph x 切分,`…` 宽度按 (family,size) 缓存。
+- bar 的 `SlotPool` 在首帧按 `width × height` 创建,不再按输出的 4096 宽预分配。
+
+### 通知语义
+
+- `default` action 不再画成胶囊,它由点击卡片主体触发;中键点击主体只关闭。
+- `Notify` 的 id 永远来自服务端计数器,`replaces_id` 只作替换键,避免与计数器后续 id 相撞。
+- urgent 颜色仍是固定的警示红,`theme.accent` 用于 action 胶囊与聚焦 chip;模板注释按此写明。

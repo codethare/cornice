@@ -83,12 +83,14 @@ impl Queue {
             Request::Notify { id, replaces_id, app_name, summary, body, actions, urgency, expire_timeout } => {
                 let expire = if expire_timeout < 0 { default_timeout(urgency) } else if expire_timeout == 0 { None } else { Some(Duration::from_millis(expire_timeout as u64)) };
                 let updated = Notification { id, app_name, summary, body: truncate_body(&body), urgency, expire, actions, created: now };
-                if replaces_id != 0 {
-                    if let Some(slot) = self.items.iter_mut().find(|n| n.id == replaces_id) {
-                        let kept_id = slot.id;
-                        *slot = Notification { id: kept_id, ..updated };
-                        return Outcome::Replaced(kept_id);
-                    }
+                // The id is authoritative: the service sets it to `replaces_id` whenever that id is one cornice
+                // handed out, so a replacement keeps both its place in the queue and its number, and a stale or
+                // invented `replaces_id` lands here as a fresh entry with the id the service allocated.
+                if replaces_id != 0
+                    && let Some(slot) = self.items.iter_mut().find(|n| n.id == replaces_id)
+                {
+                    *slot = updated;
+                    return Outcome::Replaced(replaces_id);
                 }
                 self.items.insert(0, updated);
                 // ponytail: the cap only stops "unbounded growth from a flooding client" (trust boundary),
@@ -182,17 +184,34 @@ mod tests {
         let mut q = Queue::new(4);
         assert_eq!(q.apply(notify(1, 0), now), Outcome::Added(1));
         assert_eq!(q.apply(notify(2, 0), now), Outcome::Added(2));
-        let mut req = notify_t(9, 1, -1);
-        if let Request::Notify { summary, .. } = &mut req {
+        let mut req = notify_t(1, 1, -1);
+        if let Request::Notify { summary, app_name, .. } = &mut req {
             *summary = "new".into();
+            *app_name = "app9".into();
         }
         let out = q.apply(req, now);
         assert_eq!(out, Outcome::Replaced(1));
-        assert_eq!(q.visible().len(), 2);
+        assert_eq!(q.visible().len(), 2, "replacement does not add an entry");
         assert_eq!(q.get(1).unwrap().summary, "new");
         assert_eq!(q.get(1).unwrap().app_name, "app9", "replacement also refreshes the visible source label");
         // replacing does not move it (after notify(1), notify(2) takes the head, so id=1 is still at index 1)
         assert_eq!(q.visible()[1].id, 1);
+    }
+
+    /// The id in the request is the one the D-Bus reply carries, so it must be the one the queue keeps — for a
+    /// `replaces_id` that is no longer queued as well, where the client still holds that handle.
+    #[test]
+    fn the_request_id_is_the_id_the_entry_gets() {
+        let now = Instant::now();
+        let mut q = Queue::new(4);
+        q.apply(notify(5, 0), now);
+        q.remove(5);
+        assert_eq!(q.apply(notify(5, 5), now), Outcome::Added(5), "a stale handle comes back as that handle");
+        assert_eq!(q.get(5).unwrap().summary, "s5");
+        // An invented id is allocated fresh by the service, so the request carries a different id than replaces_id.
+        assert_eq!(q.apply(notify(9, 404), now), Outcome::Added(9));
+        assert_eq!(q.get(9).unwrap().summary, "s9");
+        assert!(q.get(404).is_none(), "an entry must never take an id the request did not carry");
     }
 
     #[test]

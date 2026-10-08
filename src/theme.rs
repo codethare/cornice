@@ -51,6 +51,11 @@ impl Theme {
         Color::rgba(self.foreground.r, self.foreground.g, self.foreground.b, 0x2e)
     }
 
+    /// The focused application gets the accent behind its monogram instead of the neutral fill.
+    pub fn app_icon_focused_background(&self) -> Color {
+        Color::rgba(self.accent.r, self.accent.g, self.accent.b, 0x44)
+    }
+
     /// The window-count badge: one third of the chip, so it sits in the corner without competing with the monogram.
     pub fn app_badge_style(&self) -> TextStyle {
         TextStyle::new((self.app_icon / 3).max(1) as f32, self.font.family.clone())
@@ -135,6 +140,7 @@ mod tests {
         assert_eq!(theme.app_icon, 18);
         assert_eq!(theme.app_badge_style().size, 6.0);
         assert_ne!(theme.app_icon_background().a, 0);
+        assert_ne!(theme.app_icon_focused_background(), theme.app_icon_background(), "focus must be visible against the neutral chip");
         assert_eq!(Theme::defaults(1).app_icon, 1);
         assert_eq!(Theme::defaults(256).app_icon, 32);
     }

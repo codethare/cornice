@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 
@@ -44,10 +44,11 @@ pub fn apply_format(fmt: &str, value: &str) -> String {
 
 impl Exec {
     /// Spawn a long-running child; its stdout goes back to the main loop line by line through `tx`.
-    /// ponytail: retry at a fixed 1s after the child exits, no backoff; add backoff if it ever fails madly.
-    pub fn spawn(id: usize, command: String, format: String, tx: calloop::channel::Sender<Event>) -> Self {
+    /// With `interval` the child is one-shot and re-run every `interval` ms instead of staying resident.
+    pub fn spawn(id: usize, command: String, format: String, interval: Option<u64>, tx: calloop::channel::Sender<Event>) -> Self {
         // command is moved straight into the resident thread; no copy is kept in the struct — nothing would read it.
         std::thread::spawn(move || loop {
+            let started = Instant::now();
             let child = Command::new("sh").arg("-c").arg(&command).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
             match child {
                 Ok(mut child) => {
@@ -60,7 +61,12 @@ impl Exec {
                 }
                 Err(e) => eprintln!("cornice: failed to start exec module ({command}): {e}"),
             }
-            std::thread::sleep(Duration::from_secs(1));
+            match interval {
+                // Counted from the start of the run, so a slow command does not add its own duration to the period.
+                Some(ms) => std::thread::sleep(Duration::from_millis(ms).saturating_sub(started.elapsed())),
+                // ponytail: a resident child that exits is retried at a fixed 1s, no backoff; add backoff if it ever fails madly.
+                None => std::thread::sleep(Duration::from_secs(1)),
+            }
         });
         Self { id, format, latest: String::new() }
     }
@@ -81,10 +87,12 @@ impl Module for Exec {
 /// Open applications grouped by `app_id`; one monogram chip each, with the window count when it exceeds one.
 pub struct Applications {
     groups: Vec<(String, u32)>,
+    /// `app_id` reported as focused by the compositor's window list, when it reports one.
+    focused: Option<String>,
 }
 
 impl Applications {
-    pub fn new() -> Self { Self { groups: Vec::new() } }
+    pub fn new() -> Self { Self { groups: Vec::new(), focused: None } }
 }
 
 impl Default for Applications { fn default() -> Self { Self::new() } }
@@ -111,15 +119,47 @@ fn monogram(app_id: &str) -> String {
 
 impl Module for Applications {
     fn update(&mut self, ev: &Event) -> bool {
-        let Event::Toplevels(toplevels) = ev else { return false };
-        let groups = group(toplevels);
-        if groups == self.groups { return false; }
-        self.groups = groups;
-        true
+        match ev {
+            Event::Toplevels(toplevels) => {
+                let groups = group(toplevels);
+                if groups == self.groups { return false; }
+                self.groups = groups;
+                true
+            }
+            Event::FocusedApp(focused) => {
+                if *focused == self.focused { return false; }
+                self.focused = focused.clone();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn spans(&self) -> Vec<Span> {
-        self.groups.iter().map(|(app_id, count)| Span::application(monogram(app_id), *count)).collect()
+        self.groups
+            .iter()
+            .map(|(app_id, count)| Span::application(monogram(app_id), *count, self.focused.as_deref() == Some(app_id.as_str())))
+            .collect()
+    }
+}
+
+/// Run a module's click or wheel command. Nothing waits for it here, and the wait happens on a throwaway
+/// thread so a click cannot leave a zombie behind; stdio is discarded so the child cannot hold the bar's streams.
+pub fn spawn_detached(command: &str) {
+    let spawned = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!("cornice: failed to run module command ({command}): {e}"),
     }
 }
 
@@ -138,7 +178,7 @@ mod tests {
     #[test]
     fn exec_only_reacts_to_its_own_id() {
         let (tx, _rx) = calloop::channel::channel::<Event>();
-        let mut e = Exec::spawn(3, "true".into(), "[{out}]".into(), tx);
+        let mut e = Exec::spawn(3, "true".into(), "[{out}]".into(), None, tx);
         assert!(!e.update(&Event::Line { id: 2, text: "x".into() }));
         assert!(e.update(&Event::Line { id: 3, text: "7".into() }));
         assert_eq!(e.spans()[0].text, "[7]");
@@ -161,6 +201,25 @@ mod tests {
         let spans = applications.spans();
         assert_eq!(spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(), vec!["F", "N"]);
         assert_eq!(spans.iter().map(|span| span.badge).collect::<Vec<_>>(), vec![Some(2), Some(1)]);
+        assert!(spans.iter().all(|span| !span.focused), "nothing is focused until the compositor says so");
+    }
+
+    #[test]
+    fn only_the_focused_app_id_is_marked() {
+        let mut applications = Applications::new();
+        applications.update(&Event::Toplevels(vec![
+            Toplevel { app_id: "firefox".into() },
+            Toplevel { app_id: "kitty".into() },
+        ]));
+        assert!(applications.update(&Event::FocusedApp(Some("kitty".into()))));
+        assert!(
+            applications.spans().iter().map(|span| (span.text.as_str(), span.focused)).collect::<Vec<_>>()
+                == vec![("F", false), ("K", true)]
+        );
+        assert!(!applications.update(&Event::FocusedApp(Some("kitty".into()))), "the same focus is not dirty");
+        assert!(applications.update(&Event::FocusedApp(None)));
+        assert!(applications.spans().iter().all(|span| !span.focused), "losing focus clears the highlight");
+        assert!(applications.update(&Event::FocusedApp(Some("gone".into()))), "an app with no window is still a change");
     }
 
     #[test]

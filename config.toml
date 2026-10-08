@@ -8,6 +8,9 @@
 # Unknown keys, unknown module kinds and out-of-range numbers are all rejected (deny_unknown_fields).
 # Every line below is optional: delete it and the key returns to its default (see "default" in the comments).
 # Writing only the [bar.left] / [bar.center] / [bar.right] module lists is enough — that is where "consistency" comes from.
+#
+# Runtime control: `cornice bar toggle | show | hide`, `cornice notification dismiss <id> | -a | --all`.
+# Reload is a signal: `pkill -USR1 -x cornice` re-execs cornice in place, so config is re-read.
 
 [bar]
 # Bar height in pixels. Range 1..=256.
@@ -23,12 +26,16 @@ background_transparency = 0
 padding = 8         # default 8
 # Gap between adjacent modules, in pixels.
 spacing = 6         # default 6
+# Outputs this bar is created on, by wl_output name (`wlr-randr` lists them). Empty = every output.
+# A name that has not arrived yet, or that the compositor never sends, matches: an unknown name is not "no bar".
+outputs = []        # default []
 
 [theme]
 # Colour syntax: #rgb / #rrggbb / #rrggbbaa (ASCII only)
 background = "#1a1a1aee"    # bar and notification card base colour, default #1a1a1aee
 foreground = "#dcdcdc"      # text colour, default #dcdcdc
-accent     = "#88c0d0"      # accent colour (critical notifications etc.), default #88c0d0
+accent     = "#88c0d0"      # action pills and the focused application chip, default #88c0d0
+# Notification urgency is not themable: critical always uses the warning red.
 # Font: "family size". Omit the size to keep the default size of 11.
 font       = "monospace 11" # default monospace 11
 # Notification spacing, padding, width, radius and minimum height are derived from height and are not configurable.
@@ -37,12 +44,16 @@ font       = "monospace 11" # default monospace 11
 
 # Each of the three areas is an ordered module list: reorder it to reorder them, delete an entry to switch it off.
 # No nested containers, no layout language — that is the whole meaning of "freedom to combine".
+#
+# Each module may carry three optional commands, run with `sh -c`: `on_click` (left button),
+# `on_scroll_up` and `on_scroll_down`. A module without any of them stays click-through, so empty bar space
+# does not swallow clicks. `cornice bar toggle | show | hide` shows and hides the bar at runtime.
 
 [bar.left]
 # Built-in clock module: formats local time.
 #   format is a chrono format string, default "%H:%M".
 modules = [
-  { kind = "clock", format = "%H:%M" },
+  { kind = "clock", format = "%H:%M", on_click = "notify-send \"$(date +%H:%M)\"" },
 ]
 
 [bar.center]
@@ -51,16 +62,18 @@ modules = []
 
 [bar.right]
 modules = [
-  # Built-in exec module: runs a shell command for as long as cornice lives and reads its stdout line by line as the module text.
+  # Built-in exec module: runs a shell command and reads its stdout line by line as the module text.
   #   command is required and is run via `sh -c`; after the child exits it is retried after a fixed 1s, no backoff.
   #   format is a template where {out} is replaced by the output; when empty or omitted the raw output is shown.
+  #   interval re-runs a one-shot command every N milliseconds instead of keeping the child resident; range 1..=86400000.
   # Battery capacity, read every 5 seconds:
-  { kind = "exec", command = "while true; do cat /sys/class/power_supply/BAT0/capacity; sleep 5; done", format = "{out}%" },
+  { kind = "exec", command = "cat /sys/class/power_supply/BAT0/capacity", format = "{out}%", interval = 5000 },
   # 1-minute load average:
-  { kind = "exec", command = "while true; do awk '{print int($1)}' /proc/loadavg; sleep 2; done", format = "L{out}" },
+  { kind = "exec", command = "awk '{print int($1)}' /proc/loadavg", format = "L{out}", interval = 2000 },
   # Open applications grouped by app_id; the module can be placed in any of the three lists.
-  # The compositor only reports app_id/title, so cornice shows a monogram chip with the window count.
-  { kind = "applications" },
+  # Chips come from the compositor's window list, and the focused application is highlighted when the
+  # compositor reports focus (river does, through the wlroots window list).
+  { kind = "applications", on_click = "true" },
 ]
 
 [notification]

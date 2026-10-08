@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use calloop::{timer::{TimeoutAction, Timer}, EventLoop, LoopHandle, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState, Region},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_registry,
     foreign_toplevel_list::{ForeignToplevelList, ForeignToplevelListHandler},
     output::{OutputHandler, OutputState},
@@ -24,35 +24,62 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::{
-    globals::registry_queue_init,
+    globals::{registry_queue_init, GlobalList},
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
 };
 use smithay_client_toolkit::reexports::protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
+// Re-exported by sctk, so no extra crate: the deprecated wlroots window list is the only place river tells a
+// normal client which toplevel is focused (`river/Window.zig` sends `setAppId` and `setActivated` on it).
+use smithay_client_toolkit::reexports::protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self as wlr_handle, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self as wlr_manager, ZwlrForeignToplevelManagerV1},
+};
+use wayland_client::backend::ObjectId;
 
 use crate::config::NotificationPosition;
 use crate::geom::Rect;
 use crate::notify::queue::Notification;
 use crate::notify::view::{Card, Motion};
-use crate::widget::{Action, Event, Toplevel};
+use crate::widget::{Action, ControlRequest, Event, ModuleActions, Toplevel};
 
 pub const LAYER_NAMESPACE: &str = "cornice";
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub const CLOCK_INTERVAL: Duration = Duration::from_secs(1);
+/// Bar repaints are coalesced to this period: a module that prints faster than this cannot turn into a
+/// repaint per line, and a per-second clock still repaints immediately.
+pub const BAR_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
+/// Notification frames the compositor may still be reading before the next one is rasterised. Without
+/// this the 16 ms timer keeps allocating buffers for a compositor that is slower than the timer.
+pub const MAX_PENDING_FRAMES: u8 = 2;
 
-pub fn next_deadline(now: Instant, animating: bool, next_expiry: Option<Instant>) -> Instant {
-    let mut deadline = now + CLOCK_INTERVAL;
-    if animating { deadline = deadline.min(now + FRAME_INTERVAL); }
-    if let Some(expiry) = next_expiry { deadline = deadline.min(expiry.max(now)); }
-    deadline
+/// `Some(delay)` when a repaint still has to wait, `None` when it can happen now.
+pub fn coalesce(now: Instant, last: Instant, interval: Duration) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last);
+    (elapsed < interval).then(|| interval - elapsed)
+}
+
+/// The next wake the bar needs, or `None` when it needs none: no clock module and no pending expiry
+/// must not leave a timer ticking once a second for nothing.
+pub fn next_wake(now: Instant, clock: bool, next_expiry: Option<Instant>) -> Option<Instant> {
+    let tick = clock.then(|| now + CLOCK_INTERVAL);
+    let expiry = next_expiry.map(|expiry| expiry.max(now));
+    match (tick, expiry) {
+        (Some(tick), Some(expiry)) => Some(tick.min(expiry)),
+        (tick, expiry) => tick.or(expiry),
+    }
 }
 
 pub struct Bar {
     pub layer: LayerSurface,
-    pub pool: SlotPool,
+    /// Created on the first draw: sizing it eagerly reserved a slot for every output before anything was known
+    /// about the output's width.
+    pub pool: Option<SlotPool>,
     pub width: u32,
     pub height: u32,
     pub configured: bool,
+    /// Click and wheel targets in surface coordinates, from the last draw.
+    pub hits: Vec<(Rect, ModuleActions)>,
 }
 
 pub struct NotifSurface {
@@ -66,6 +93,26 @@ pub struct NotifSurface {
     pub card: Card,
     pub motion: Motion,
     pub hits: Vec<(Rect, Action)>,
+    /// Frames committed but not presented yet; the `wl_surface.frame` callback only reports that number, so it
+    /// is not stored.
+    pending_frames: u8,
+}
+
+/// One mapped toplevel as the wlroots window list reports it.
+#[derive(Default)]
+struct FocusHandle {
+    app_id: String,
+    activated: bool,
+}
+
+/// Focus tracking. `manager` is `None` when the compositor does not offer the window list, in which case the
+/// bar simply has no focus information and no chip is highlighted.
+#[derive(Default)]
+struct Focus {
+    manager: Option<ZwlrForeignToplevelManagerV1>,
+    handles: HashMap<ObjectId, (ZwlrForeignToplevelHandleV1, FocusHandle)>,
+    /// Last value handed to the bar modules, so an event burst does not become a message burst.
+    published: Option<String>,
 }
 
 pub struct State {
@@ -90,7 +137,17 @@ pub struct State {
     pub queue: crate::notify::queue::Queue,
     pub dbus: Option<zbus::blocking::Connection>,
     pub notifications: HashMap<u32, NotifSurface>,
+    /// Whether the bar is shown at all; `cornice bar hide` clears this.
+    pub bar_visible: bool,
+    focus: Focus,
     frame_id: Option<RegistrationToken>,
+    idle_id: Option<RegistrationToken>,
+    /// Deadline the idle timer registration is armed for, so a new earlier expiry can re-arm it instead of
+    /// waiting for the old one.
+    idle_deadline: Option<Instant>,
+    /// Pending coalesced bar repaint, and when the last one happened.
+    bar_redraw_id: Option<RegistrationToken>,
+    bar_drawn_at: Instant,
     loop_handle: LoopHandle<'static, State>,
 }
 
@@ -110,7 +167,8 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
     let (sections, event_rx, event_tx) = crate::bar::Sections::from_config(&cfg);
     let max_visible = cfg.notification.as_ref().map_or(1, |notification| notification.max_visible);
     let (notification_tx, notification_rx) = calloop::channel::channel::<crate::notify::queue::Request>();
-    let dbus = match crate::notify::service::spawn(notification_tx) {
+    let (control_tx, control_rx) = calloop::channel::channel::<ControlRequest>();
+    let dbus = match crate::notify::service::spawn(notification_tx, control_tx) {
         Ok(connection) => Some(connection),
         Err(error) => {
             eprintln!("cornice: notifications unavailable: {error}");
@@ -141,15 +199,31 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
         queue: crate::notify::queue::Queue::new(max_visible),
         dbus,
         notifications: HashMap::new(),
+        bar_visible: true,
+        focus: Focus::default(),
         frame_id: None,
+        idle_id: None,
+        idle_deadline: None,
+        bar_redraw_id: None,
+        bar_drawn_at: Instant::now(),
         loop_handle: handle.clone(),
     };
+
+    state.bind_focus(&globals, &qh);
 
     WaylandSource::new(connection, event_queue).insert(handle.clone()).map_err(|error| format!("failed to insert the wayland source: {error}"))?;
     handle.insert_source(event_rx, |message, _metadata, state: &mut State| {
         let calloop::channel::Event::Msg(event) = message else { return };
-        if state.sections.update(&event) { state.redraw_all(); }
+        if state.sections.update(&event) { state.bar_changed(Instant::now()); }
     }).map_err(|error| format!("failed to insert the exec channel: {error}"))?;
+    handle.insert_source(control_rx, |message, _metadata, state: &mut State| {
+        let calloop::channel::Event::Msg(request) = message else { return };
+        let visible = match request {
+            ControlRequest::ToggleBar => !state.bar_visible,
+            ControlRequest::SetBarVisible(visible) => visible,
+        };
+        state.set_bar_visible(visible);
+    }).map_err(|error| format!("failed to insert the control channel: {error}"))?;
     handle.insert_source(notification_rx, |message, _metadata, state: &mut State| {
         let calloop::channel::Event::Msg(request) = message else { return };
         let now = Instant::now();
@@ -163,16 +237,15 @@ pub fn run(cfg: crate::config::Config) -> Result<(), String> {
             }
             crate::notify::queue::Outcome::Ignored => false,
         };
+        // A new entry may be the first thing that needs a timer since startup.
+        state.ensure_idle_timer();
         if changed {
             state.sync_notifications(now);
             state.redraw_notifications(now);
         }
     }).map_err(|error| format!("failed to insert the notification channel: {error}"))?;
-    handle.insert_source(Timer::from_duration(CLOCK_INTERVAL), |_deadline, _metadata, state: &mut State| {
-        let now = Instant::now();
-        state.on_wake(now);
-        TimeoutAction::ToInstant(next_deadline(now, false, state.queue.next_expiry()))
-    }).map_err(|error| format!("failed to insert the idle timer: {error}"))?;
+
+    state.ensure_idle_timer();
 
     while !state.exit {
         event_loop.dispatch(None, &mut state).map_err(|error| format!("event loop error: {error}"))?;
@@ -191,8 +264,127 @@ impl State {
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, self.bar_height);
         layer.commit();
-        let pool = SlotPool::new(self.bar_height as usize * 4096 * 4, &self.shm).expect("failed to create the bar shm pool");
-        self.bars.insert(output, Bar { layer, pool, width: 0, height: self.bar_height, configured: false });
+        self.bars.insert(output, Bar { layer, pool: None, width: 0, height: self.bar_height, configured: false, hits: Vec::new() });
+    }
+
+    /// Reconcile the bars with the configured outputs and the current visibility. Called for output
+    /// add/update, for `cornice bar show|hide`, and at startup.
+    fn sync_bars(&mut self) {
+        for output in self.output_state.outputs() {
+            let wanted = self.bar_visible && self.output_allowed(&output);
+            match (self.bars.contains_key(&output), wanted) {
+                (true, false) => {
+                    self.bars.remove(&output);
+                }
+                (false, true) => self.add_bar(output),
+                _ => {}
+            }
+        }
+    }
+
+    fn output_allowed(&self, output: &wl_output::WlOutput) -> bool {
+        let name = self.output_state.info(output).and_then(|info| info.name);
+        crate::config::output_matches(&self.cfg.bar.outputs, name.as_deref())
+    }
+
+    fn set_bar_visible(&mut self, visible: bool) {
+        if self.bar_visible == visible {
+            return;
+        }
+        self.bar_visible = visible;
+        self.sync_bars();
+    }
+
+    /// Arm the idle timer when anything still needs a wakeup, and drop it when nothing does: an idle bar
+    /// without a clock module does not wake the process every second. Re-arming only happens when the deadline
+    /// actually changes, so the steady state is the callback rescheduling itself.
+    fn ensure_idle_timer(&mut self) {
+        let now = Instant::now();
+        let deadline = next_wake(now, self.sections.has_clock, self.queue.next_expiry());
+        if deadline == self.idle_deadline {
+            return;
+        }
+        if let Some(token) = self.idle_id.take() {
+            self.loop_handle.remove(token);
+        }
+        self.idle_deadline = deadline;
+        let Some(deadline) = deadline else { return };
+        let token = self.loop_handle.insert_source(Timer::from_deadline(deadline), |_deadline, _metadata, state: &mut State| {
+            let now = Instant::now();
+            state.on_wake(now);
+            state.wake_deadline(now)
+        });
+        if let Ok(token) = token {
+            self.idle_id = Some(token);
+        }
+    }
+
+    /// Timer callback tail: either the next deadline, or drop the source and forget its token.
+    fn wake_deadline(&mut self, now: Instant) -> TimeoutAction {
+        let deadline = next_wake(now, self.sections.has_clock, self.queue.next_expiry());
+        self.idle_deadline = deadline;
+        match deadline {
+            Some(deadline) => TimeoutAction::ToInstant(deadline),
+            None => {
+                self.idle_id = None;
+                TimeoutAction::Drop
+            }
+        }
+    }
+
+    /// Ask for a bar repaint, coalesced to one per `BAR_REDRAW_INTERVAL`.
+    fn bar_changed(&mut self, now: Instant) {
+        match coalesce(now, self.bar_drawn_at, BAR_REDRAW_INTERVAL) {
+            None => {
+                self.bar_drawn_at = now;
+                self.redraw_all();
+            }
+            Some(delay) if self.bar_redraw_id.is_none() => {
+                let token = self.loop_handle.insert_source(Timer::from_duration(delay), |_deadline, _metadata, state: &mut State| {
+                    state.bar_redraw_id = None;
+                    state.bar_drawn_at = Instant::now();
+                    state.redraw_all();
+                    TimeoutAction::Drop
+                });
+                if let Ok(token) = token {
+                    self.bar_redraw_id = Some(token);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Bind the compositor's window list when it offers one. Its absence is not an error: the bar then simply
+    /// has no focused application.
+    fn bind_focus(&mut self, globals: &GlobalList, qh: &QueueHandle<State>) {
+        match globals.bind::<ZwlrForeignToplevelManagerV1, State, ()>(qh, 1..=3, ()) {
+            Ok(manager) => self.focus.manager = Some(manager),
+            Err(error) => eprintln!("cornice: no focused-window information ({error})"),
+        }
+    }
+
+    fn focus_state(&mut self, handle: &ZwlrForeignToplevelHandleV1) -> Option<&mut FocusHandle> {
+        self.focus.handles.get_mut(&handle.id()).map(|(_, info)| info)
+    }
+
+    /// Hand the focused `app_id` to the bar modules, but only when it actually changed. With no window list there
+    /// is no focus to report, so nothing is sent at all.
+    fn publish_focus(&mut self) {
+        if self.focus.manager.is_none() {
+            return;
+        }
+        let focused = self
+            .focus
+            .handles
+            .values()
+            .find(|(_, info)| info.activated)
+            .map(|(_, info)| info.app_id.clone())
+            .filter(|app_id| !app_id.is_empty());
+        if focused == self.focus.published {
+            return;
+        }
+        self.focus.published = focused.clone();
+        let _ = self.event_tx.send(Event::FocusedApp(focused));
     }
 
     pub fn redraw_all(&mut self) {
@@ -222,6 +414,10 @@ impl State {
 
     fn create_notification_surface(&mut self, card: Card, notification: Notification, now: Instant, enter_ms: u64) {
         let Some((position, _, _)) = self.notification_settings() else { return };
+        let Ok(pool) = SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm) else {
+            eprintln!("cornice: cannot create the notification buffer pool");
+            return;
+        };
         let qh = self.qh.clone();
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some(LAYER_NAMESPACE), None);
@@ -242,7 +438,6 @@ impl State {
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(card.rect.w as u32, card.rect.h as u32);
         layer.commit();
-        let pool = SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm).expect("failed to create the notification shm pool");
         let motion = Motion::new(now, card.top, enter_ms);
         self.notifications.insert(notification.id, NotifSurface {
             layer,
@@ -255,6 +450,7 @@ impl State {
             card,
             motion,
             hits: Vec::new(),
+            pending_frames: 0,
         });
     }
 
@@ -283,7 +479,20 @@ impl State {
             let Some(notification) = self.queue.visible().iter().find(|notification| notification.id == card.id) else { continue };
             if self.notifications.contains_key(&card.id) {
                 let resize = self.notifications.get(&card.id).is_some_and(|surface| surface.card.rect != card.rect);
-                let pool = resize.then(|| SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm).expect("failed to resize the notification shm pool"));
+                let pool = if resize {
+                    match SlotPool::new(card.rect.w as usize * card.rect.h as usize * 4, &self.shm) {
+                        Ok(pool) => Some(pool),
+                        Err(error) => {
+                            eprintln!("cornice: cannot resize the notification buffer pool: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if resize && pool.is_none() {
+                    continue;
+                }
                 if let Some(surface) = self.notifications.get_mut(&card.id) {
                     changed |= surface.notification != *notification;
                     surface.notification = notification.clone();
@@ -351,7 +560,7 @@ impl State {
         for id in self.queue.expire(now) {
             if let Some(connection) = &self.dbus { let _ = crate::notify::service::emit_closed(connection, id, 1); }
         }
-        if self.sections.update(&crate::widget::Event::Wake) { self.redraw_all(); }
+        if self.sections.update(&crate::widget::Event::Wake) { self.bar_changed(now); }
         changed |= self.sync_notifications(now);
         if changed || self.animating { self.redraw_notifications(now); }
     }
@@ -365,6 +574,7 @@ impl State {
     fn redraw_notifications(&mut self, now: Instant) {
         let Some((_, _, _)) = self.notification_settings() else { return };
         if self.notifications.is_empty() { return; }
+        let qh = self.qh.clone();
         let side = crate::notify::view::side_margin(&self.theme);
         let position = self.notification_settings().map(|settings| settings.0).expect("settings exist");
 
@@ -376,13 +586,21 @@ impl State {
                 0,
                 if position == NotificationPosition::Left { side } else { 0 },
             );
+            // The compositor is the clock: while it still holds `MAX_PENDING_FRAMES` un-presented frames,
+            // rasterising another one only grows the buffer pool. The last frame of an animation is always
+            // drawn, so a card can never get stuck half-faded.
+            if notification.pending_frames >= MAX_PENDING_FRAMES && notification.motion.is_animating(now) {
+                continue;
+            }
             if !notification.configured || notification.width == 0 || notification.height == 0 { continue; }
 
             let width = notification.width as i32;
             let height = notification.height as i32;
             let visual = notification.motion.visual(now, notification.card.rect.w, notification.card.rect.h);
-            let (buffer, data) = notification.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
-                .expect("failed to create the notification buffer");
+            let Ok((buffer, data)) = notification.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888) else {
+                eprintln!("cornice: cannot create the notification buffer");
+                continue;
+            };
             let mut canvas = crate::canvas::Canvas::new(data, width, height);
             canvas.clear();
             canvas.set_clip(Some(visual.rect));
@@ -396,44 +614,75 @@ impl State {
                     let visible = rect.intersect(visual.rect);
                     if !visible.is_empty() { hits.push((visible, action)); }
                 }
-                hits.push((visual.rect, Action::NotificationClose(notification.card.id)));
+                hits.push((visual.rect, Action::NotificationBody(notification.card.id)));
             }
 
-            let region = Region::new(&self.compositor).expect("failed to create the notification input region");
-            for (rect, _) in &hits { region.add(rect.x, rect.y, rect.w, rect.h); }
-            notification.layer.set_input_region(Some(region.wl_region()));
+            match Region::new(&self.compositor) {
+                Ok(region) => {
+                    for (rect, _) in &hits { region.add(rect.x, rect.y, rect.w, rect.h); }
+                    notification.layer.set_input_region(Some(region.wl_region()));
+                }
+                Err(error) => eprintln!("cornice: cannot create the notification input region: {error}"),
+            }
+            // Requested before the commit so the callback reports this frame; it is also what releases the
+            // next one (see `pending_frames`).
+            let surface = notification.layer.wl_surface().clone();
+            let _ = surface.frame(&qh, FrameCallbackData(surface.clone()));
+            notification.pending_frames = notification.pending_frames.saturating_add(1);
             notification.layer.wl_surface().damage_buffer(0, 0, width, height);
-            buffer.attach_to(notification.layer.wl_surface()).expect("attach failed");
+            if let Err(error) = buffer.attach_to(notification.layer.wl_surface()) {
+                eprintln!("cornice: cannot attach the notification buffer: {error}");
+                continue;
+            }
             notification.layer.commit();
             notification.hits = hits;
         }
     }
 
     fn redraw(&mut self, output: &wl_output::WlOutput) {
-        let qh = self.qh.clone();
-        if let Some(bar) = self.bars.get_mut(output) { draw_bar(bar, &qh, &self.theme, &mut self.text, &mut self.sections); }
+        let State { bars, compositor, shm, theme, text, sections, .. } = self;
+        if let Some(bar) = bars.get_mut(output) {
+            draw_bar(bar, compositor, shm, theme, text, sections);
+        }
     }
 }
 
-fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme, text: &mut crate::text::TextEngine, sections: &mut crate::bar::Sections) {
+fn draw_bar(bar: &mut Bar, compositor: &CompositorState, shm: &Shm, theme: &crate::theme::Theme, text: &mut crate::text::TextEngine, sections: &mut crate::bar::Sections) {
     if !bar.configured { return; }
     let width = bar.width.max(1) as i32;
     let height = bar.height.max(1) as i32;
+    if bar.pool.is_none() {
+        // One slot per configured buffer; the pool grows on its own if a repaint overlaps the previous one.
+        match SlotPool::new((width as usize) * (height as usize) * 4, shm) {
+            Ok(pool) => bar.pool = Some(pool),
+            Err(error) => {
+                eprintln!("cornice: cannot create the bar buffer pool: {error}");
+                return;
+            }
+        }
+    }
     let widths = sections.widths(text, theme);
     let layout = crate::bar::layout(&widths, width, theme);
-    let (buffer, data) = bar.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888).expect("failed to create the bar buffer");
+    let Some(pool) = bar.pool.as_mut() else { return };
+    let Ok((buffer, data)) = pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888) else {
+        eprintln!("cornice: cannot create the bar buffer");
+        return;
+    };
     let mut canvas = crate::canvas::Canvas::new(data, width, height);
     canvas.clear();
     canvas.fill_rect(Rect::new(0, 0, width, height), theme.bar_background());
     let top = text.optical_top(&theme.font, 0, theme.height);
+    bar.hits.clear();
     let rows = [
-        (&layout.left[..], &mut sections.left[..]),
-        (&layout.center[..], &mut sections.center[..]),
-        (&layout.right[..], &mut sections.right[..]),
+        (&layout.left[..], &mut sections.left[..], &sections.left_actions[..]),
+        (&layout.center[..], &mut sections.center[..], &sections.center_actions[..]),
+        (&layout.right[..], &mut sections.right[..], &sections.right_actions[..]),
     ];
-    for (rects, modules) in rows {
-        for (rect, module) in rects.iter().zip(modules.iter_mut()) {
+    for (rects, modules, actions) in rows {
+        for ((rect, module), actions) in rects.iter().zip(modules.iter_mut()).zip(actions.iter()) {
             if rect.is_empty() { continue; }
+            // The whole module is the click target, including the gaps between its spans.
+            if actions.any() { bar.hits.push((*rect, actions.clone())); }
             let spans = crate::bar::fit_text(&module.spans(), rect.w, text, theme);
             let mut x = rect.x;
             for (index, span) in spans.iter().enumerate() {
@@ -441,16 +690,19 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
                 if let Some(count) = span.badge {
                     let icon = theme.app_icon.min(rect.h).max(1);
                     let chip = Rect::new(x, rect.y + (rect.h - icon) / 2, icon, icon);
-                    canvas.fill_rounded_rect(chip, theme.app_icon / 4, theme.app_icon_background());
-                    let color = span.color.unwrap_or(theme.foreground);
+                    let (background, color) = if span.focused {
+                        (theme.app_icon_focused_background(), theme.accent)
+                    } else {
+                        (theme.app_icon_background(), span.color.unwrap_or(theme.foreground))
+                    };
+                    canvas.fill_rounded_rect(chip, theme.app_icon / 4, background);
                     let (label_width, _) = text.measure(&span.text, &theme.font);
                     let label_x = chip.x + ((chip.w - label_width.ceil() as i32) / 2).max(0);
                     let label_y = text.optical_top(&theme.font, chip.y, chip.h);
                     text.draw(&mut canvas, &span.text, label_x, label_y, &theme.font, color);
                     if count > 1 {
                         let style = theme.app_badge_style();
-                        let label = count.to_string();
-                        let label = crate::text::truncate_to_width(&label, (chip.w - 2).max(1) as f32, |value| text.measure(value, &style).0);
+                        let label = text.fit_text(&count.to_string(), &style, (chip.w - 2).max(1) as f32);
                         let (badge_width, _) = text.measure(&label, &style);
                         let badge_x = chip.right() - badge_width.ceil() as i32;
                         let metrics = text.cap_metrics(&style);
@@ -466,8 +718,20 @@ fn draw_bar(bar: &mut Bar, _qh: &QueueHandle<State>, theme: &crate::theme::Theme
             }
         }
     }
+    // Same data as the hit rects: the bar swallows clicks only where a module actually listens, so empty
+    // bar space stays click-through. Never `None` — that would be an infinite region.
+    match Region::new(compositor) {
+        Ok(region) => {
+            for (rect, _) in &bar.hits { region.add(rect.x, rect.y, rect.w, rect.h); }
+            bar.layer.set_input_region(Some(region.wl_region()));
+        }
+        Err(error) => eprintln!("cornice: cannot create the bar input region: {error}"),
+    }
     bar.layer.wl_surface().damage_buffer(0, 0, width, height);
-    buffer.attach_to(bar.layer.wl_surface()).expect("attach failed");
+    if let Err(error) = buffer.attach_to(bar.layer.wl_surface()) {
+        eprintln!("cornice: cannot attach the bar buffer: {error}");
+        return;
+    }
     bar.layer.commit();
 }
 
@@ -490,10 +754,7 @@ impl LayerShellHandler for State {
             if let Some(surface) = self.notifications.get_mut(&id) {
                 if let Some(width) = NonZeroU32::new(configure.new_size.0) { surface.width = width.get(); }
                 if let Some(height) = NonZeroU32::new(configure.new_size.1) { surface.height = height.get(); }
-                if !surface.configured {
-                    surface.configured = true;
-                    eprintln!("notif {} configured: {}x{}", id, surface.width, surface.height);
-                }
+                surface.configured = true;
             }
             self.redraw_notifications(Instant::now());
             return;
@@ -503,10 +764,7 @@ impl LayerShellHandler for State {
         if let Some(bar) = self.bars.get_mut(&output) {
             if let Some(width) = NonZeroU32::new(configure.new_size.0) { bar.width = width.get(); }
             if let Some(height) = NonZeroU32::new(configure.new_size.1) { bar.height = height.get(); }
-            if !bar.configured {
-                bar.configured = true;
-                eprintln!("bar configured: {}x{}", bar.width, bar.height);
-            }
+            bar.configured = true;
         }
         self.redraw(&output);
     }
@@ -514,8 +772,10 @@ impl LayerShellHandler for State {
 
 impl OutputHandler for State {
     fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
-    fn new_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) { self.add_bar(output); }
-    fn update_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
+    // The output's name usually arrives after the global is announced, so the bars are reconciled on both
+    // events: a bar for an unwanted output is created first only when the name is still unknown.
+    fn new_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) { self.sync_bars(); }
+    fn update_output(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) { self.sync_bars(); }
     fn output_destroyed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.bars.remove(&output);
         let removed: Vec<_> = self.notifications.iter()
@@ -545,14 +805,36 @@ impl PointerHandler for State {
     fn pointer_frame(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         let mut closed = None;
         for event in events {
+            let (x, y) = (event.position.0 as i32, event.position.1 as i32);
+            if let Some(bar) = self.bars.values().find(|bar| bar.layer.wl_surface() == &event.surface) {
+                let Some((_, actions)) = bar.hits.iter().find(|(rect, _)| rect.contains(x, y)) else { continue };
+                let command = match event.kind {
+                    PointerEventKind::Press { button: BTN_LEFT, .. } => actions.on_click.as_deref(),
+                    // A positive value120 is the direction the content moves, i.e. a wheel notch downwards.
+                    PointerEventKind::Axis { vertical, .. } if vertical.value120 > 0 => actions.on_scroll_down.as_deref(),
+                    PointerEventKind::Axis { vertical, .. } if vertical.value120 < 0 => actions.on_scroll_up.as_deref(),
+                    _ => None,
+                };
+                if let Some(command) = command { crate::bar::modules::spawn_detached(command); }
+                continue;
+            }
             let Some((_, surface)) = self.notifications.iter().find(|(_, surface)| surface.layer.wl_surface() == &event.surface) else { continue };
             let PointerEventKind::Press { button, .. } = event.kind else { continue };
-            match crate::notify::view::hit(&surface.hits, event.position.0 as i32, event.position.1 as i32) {
+            match crate::notify::view::hit(&surface.hits, x, y) {
                 Some(Action::NotificationAction { id, key }) if button == BTN_LEFT => {
                     if let Some(connection) = &self.dbus { let _ = crate::notify::service::emit_action(connection, id, &key); }
                     closed = Some(id);
                 }
-                Some(Action::NotificationClose(id)) if button == BTN_LEFT || button == BTN_MIDDLE => closed = Some(id),
+                Some(Action::NotificationBody(id)) if button == BTN_LEFT || button == BTN_MIDDLE => {
+                    // A client's `default` action means "the notification itself is the button"; the middle
+                    // button only dismisses, which is what the card has always done.
+                    let has_default = button == BTN_LEFT
+                        && self.notifications.get(&id).is_some_and(|surface| crate::notify::view::has_default_action(&surface.notification));
+                    if has_default && let Some(connection) = &self.dbus {
+                        let _ = crate::notify::service::emit_action(connection, id, "default");
+                    }
+                    closed = Some(id);
+                }
                 _ => {}
             }
         }
@@ -569,7 +851,11 @@ impl PointerHandler for State {
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        // The presented frame releases both the buffer slot and the next repaint of this surface.
+        let Some(notification) = self.notifications.values_mut().find(|notification| notification.layer.wl_surface() == surface) else { return };
+        notification.pending_frames = notification.pending_frames.saturating_sub(1);
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, output: &wl_output::WlOutput) {
         let Some((_, notification)) = self.notifications.iter_mut().find(|(_, notification)| notification.layer.wl_surface() == surface) else { return };
         if notification.output.as_ref() != Some(output) { notification.output = Some(output.clone()); }
@@ -589,6 +875,48 @@ impl ShmHandler for State {
     fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
 }
 
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
+    fn event(state: &mut Self, _manager: &ZwlrForeignToplevelManagerV1, event: wlr_manager::Event, _data: &(), _conn: &Connection, _qh: &QueueHandle<Self>) {
+        match event {
+            wlr_manager::Event::Toplevel { toplevel } => {
+                state.focus.handles.insert(toplevel.id(), (toplevel, FocusHandle::default()));
+            }
+            wlr_manager::Event::Finished => {
+                state.focus.handles.clear();
+                // Report the lost focus before forgetting the source, or a highlighted chip would stay lit.
+                state.publish_focus();
+                state.focus.manager = None;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+        wlr_manager::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
+    fn event(state: &mut Self, handle: &ZwlrForeignToplevelHandleV1, event: wlr_handle::Event, _data: &(), _conn: &Connection, _qh: &QueueHandle<Self>) {
+        match event {
+            wlr_handle::Event::AppId { app_id } => {
+                if let Some(info) = state.focus_state(handle) { info.app_id = app_id; }
+            }
+            // A positive value120 is the direction the content moves, i.e. a wheel notch downwards.
+            wlr_handle::Event::State { state: states } => {
+                let activated = states.as_chunks::<4>().0.iter().any(|value| u32::from_le_bytes(*value) == wlr_handle::State::Activated as u32);
+                if let Some(info) = state.focus_state(handle) { info.activated = activated; }
+            }
+            wlr_handle::Event::Closed => {
+                state.focus.handles.remove(&handle.id());
+            }
+            // Title, output membership, parent and the deprecated single-state events carry nothing the bar shows.
+            _ => return,
+        }
+        state.publish_focus();
+    }
+}
+
 delegate_registry!(State);
 
 impl ProvidesRegistryState for State {
@@ -603,24 +931,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn animating_asks_for_next_frame() {
+    fn an_idle_bar_with_a_clock_wakes_once_a_second() {
         let now = Instant::now();
-        assert_eq!(next_deadline(now, true, None), now + FRAME_INTERVAL);
+        assert_eq!(next_wake(now, true, None), Some(now + CLOCK_INTERVAL));
+    }
+
+    /// The point of the whole exercise: no clock, nothing pending — no timer at all.
+    #[test]
+    fn an_idle_bar_without_a_clock_does_not_wake() {
+        let now = Instant::now();
+        assert_eq!(next_wake(now, false, None), None);
     }
 
     #[test]
-    fn idle_waits_for_the_clock_tick() {
-        let now = Instant::now();
-        assert_eq!(next_deadline(now, false, None), now + CLOCK_INTERVAL);
-    }
-
-    #[test]
-    fn earliest_deadline_wins_and_never_returns_the_past() {
+    fn the_earliest_deadline_wins_and_never_returns_the_past() {
         let now = Instant::now();
         let soon = now + Duration::from_millis(5);
         let later = now + Duration::from_secs(30);
-        assert_eq!(next_deadline(now, true, Some(soon)), soon);
-        assert_eq!(next_deadline(now, false, Some(later)), now + CLOCK_INTERVAL);
-        assert_eq!(next_deadline(now, false, Some(now - Duration::from_secs(1))), now);
+        assert_eq!(next_wake(now, true, Some(soon)), Some(soon));
+        assert_eq!(next_wake(now, true, Some(later)), Some(now + CLOCK_INTERVAL));
+        assert_eq!(next_wake(now, false, Some(later)), Some(later), "without a clock only the expiry matters");
+        assert_eq!(next_wake(now, false, Some(now - Duration::from_secs(1))), Some(now));
+    }
+
+    #[test]
+    fn repaints_are_coalesced_to_one_per_interval() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(50);
+        assert_eq!(coalesce(now, now - interval, interval), None, "the interval has passed, draw now");
+        assert_eq!(coalesce(now, now, interval), Some(interval));
+        assert_eq!(coalesce(now, now - Duration::from_millis(20), interval), Some(Duration::from_millis(30)));
+        // A last draw in the future (a clock that jumped) waits a full interval instead of a negative one.
+        assert_eq!(coalesce(now, now + Duration::from_secs(1), interval), Some(interval));
     }
 }
