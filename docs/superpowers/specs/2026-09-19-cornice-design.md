@@ -217,6 +217,7 @@ card_min_h   = max(2.5 × height, text line + 2 × card_padding)
 
 - 宽度固定,同一列中的卡片等宽;高度按内容增长,最低为 `card_min_h`。
 - 内容在卡片内垂直居中;标题与来源组成第一行,正文/actions 作为 detail block。
+- 标题与来源之间用一条低对比度竖线分隔:厚度同为 `max(card_gap / 3, 1)`,高度取字体的 cap 高度,垂直居中于标题行,左右各留 `card_gap / 2`;来源为空时不画。
 - detail block 与标题间使用 `card_gap / 2` 和 `max(card_gap / 3, 1)` 的低对比度分隔线。
 - 卡片背景使用 `theme.background` 的半透明色,所有圆角使用 `geom::CORNER_EXPONENT = 4` 的连续曲线。
 - 卡片与 bar 没有重叠,因此不画“接在 bar 底边下面”的特例,也不画第二层背景。

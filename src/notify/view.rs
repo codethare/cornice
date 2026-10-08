@@ -24,6 +24,15 @@ pub fn urgency_color(u: Urgency, theme: &Theme) -> Color {
 
 fn line_height(theme: &Theme) -> i32 { (theme.font.size * 1.35).ceil() as i32 }
 fn divider_height(theme: &Theme) -> i32 { (theme.card_gap / 3).max(1) }
+
+/// The vertical hairline between the headline and the source: thickness matches the detail divider,
+/// height matches the measured cap, and both sides keep `card_gap / 2` so no text reaches it.
+fn headline_rule(theme: &Theme, cap: f32, summary: i32, line: i32, source_x: i32) -> Rect {
+    let thickness = divider_height(theme);
+    let height = (cap.round() as i32).max(1);
+    Rect::new(source_x - theme.card_gap / 2 - thickness, summary + (line - height) / 2, thickness, height)
+}
+
 fn body_lines(n: &Notification) -> usize { if n.body.is_empty() { 0 } else { n.body.lines().count().min(crate::notify::queue::MAX_BODY_LINES) } }
 fn first_line(text: &str) -> &str { text.lines().next().unwrap_or("") }
 fn has_actions(n: &Notification) -> bool { n.actions.iter().any(|(_, label)| !first_line(label).trim().is_empty()) }
@@ -170,17 +179,19 @@ pub fn render(canvas: &mut Canvas, card: &Card, alpha: f32, notification: &Notif
 
     let source = first_line(notification.app_name.trim());
     let source = crate::text::truncate_to_width(source, inner_w / 3.0, |value| text.measure(value, &theme.font).0);
+    let cap = text.cap_metrics(&theme.font).cap;
     let source_w = if source.is_empty() { 0 } else { text.measure(&source, &theme.font).0.ceil() as i32 };
     let source_x = right - source_w;
-    let summary_w = if source.is_empty() { inner_w } else { (source_x - theme.card_gap - x).max(0) as f32 };
+    let rule = if source.is_empty() { None } else { Some(headline_rule(theme, cap, card.summary, line, source_x)) };
+    let summary_w = match rule { Some(rule) => (rule.x - theme.card_gap / 2 - x).max(0) as f32, None => inner_w };
     let summary = crate::text::truncate_to_width(first_line(&notification.summary), summary_w, |value| text.measure(value, &theme.font).0);
     let summary_y = text.optical_top(&theme.font, card.summary, line);
     text.draw(canvas, &summary, x, summary_y, &theme.font, fa(urgency_color(notification.urgency, theme)));
     if !source.is_empty() { text.draw(canvas, &source, source_x, summary_y, &theme.font, fa(theme.secondary)); }
-
+    let hairline = fa(Color::rgba(theme.secondary.r, theme.secondary.g, theme.secondary.b, (theme.secondary.a as u16 * DIVIDER_ALPHA_PERCENT / 100) as u8));
+    if let Some(rule) = rule { canvas.fill_rect(rule, hairline); }
     if let Some(y) = card.divider {
-        let divider = Color::rgba(theme.secondary.r, theme.secondary.g, theme.secondary.b, (theme.secondary.a as u16 * DIVIDER_ALPHA_PERCENT / 100) as u8);
-        canvas.fill_rect(Rect::new(x, y, inner_w as i32, divider_height(theme)), fa(divider));
+        canvas.fill_rect(Rect::new(x, y, inner_w as i32, divider_height(theme)), hairline);
     }
     if let Some(mut y) = card.body {
         for body_line in notification.body.lines().take(crate::notify::queue::MAX_BODY_LINES) {
@@ -261,6 +272,17 @@ mod tests {
         let divider = with_body[0].divider.unwrap();
         assert_eq!(divider, with_body[0].summary + line_height(&theme) + theme.card_gap / 2);
         assert_eq!(with_body[0].body, Some(divider + divider_height(&theme)));
+    }
+
+    #[test]
+    fn headline_rule_keeps_its_distance_from_title_and_source() {
+        let theme = Theme::defaults(30);
+        let line = line_height(&theme);
+        let rule = headline_rule(&theme, 12.0, 10, line, 200);
+        assert_eq!(rule.w, divider_height(&theme));
+        assert_eq!(rule.h, 12);
+        assert_eq!(rule.right(), 200 - theme.card_gap / 2);
+        assert_eq!(rule.y, 10 + (line - 12) / 2);
     }
 
     #[test]
