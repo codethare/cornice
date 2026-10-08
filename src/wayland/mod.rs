@@ -234,9 +234,9 @@ impl State {
         layer.set_anchor(anchor);
         layer.set_margin(
             crate::notify::view::surface_top(&self.theme, self.cfg.bar.margin, card.top),
-            if position == NotificationPosition::Left { side } else { 0 },
             if position == NotificationPosition::Right { side } else { 0 },
             0,
+            if position == NotificationPosition::Left { side } else { 0 },
         );
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -372,9 +372,9 @@ impl State {
             let top = crate::notify::view::surface_top(&self.theme, self.cfg.bar.margin, notification.motion.top(now));
             notification.layer.set_margin(
                 top,
-                if position == NotificationPosition::Left { side } else { 0 },
                 if position == NotificationPosition::Right { side } else { 0 },
                 0,
+                if position == NotificationPosition::Left { side } else { 0 },
             );
             if !notification.configured || notification.width == 0 || notification.height == 0 { continue; }
 

@@ -154,7 +154,17 @@ close_id() {
         --method org.freedesktop.Notifications.CloseNotification -- "$1" >/dev/null 2>&1
 }
 
-close_all() { local i; for i in $(seq 1 40); do close_id "$i"; done; sleep 0.5; }
+# CloseNotification only drops a queued entry; the card keeps animating out for exit_ms afterwards, so wait for
+# the column to actually go empty. Measuring CPU while a card is still on screen tests the frame source, not idleness.
+close_all() {
+    local i
+    for i in $(seq 1 40); do close_id "$i"; done
+    for _ in $(seq 1 40); do
+        grim -t ppm "$W/idle.ppm" 2>/dev/null
+        [ "$(bands idle)" -eq 0 ] && { sleep 0.3; return; }
+        sleep 0.1
+    done
+}
 
 # notifications signals seen so far, as "id reason" lines
 closed_pairs() {
@@ -236,12 +246,26 @@ sec "notifications: independent cards below the bar"
 # measuring the translucent card material. A fresh toplevel is started in the click-through section.
 stop_tree "${win_bg:-}"; win_bg=
 bands() { px bands "$W/$1.ppm" "$((OUT_W - 20))" $((BAR_H + 1)) "$OUT_H"; }
+
+# grim races the per-card commit, so a single shot can catch the column mid-draw: a card missing, or a card caught
+# mid-spring. Sample until two consecutive frames are byte-identical; callers keep their sleep so the motion has
+# started and this only has to confirm it finished.
+shot_settled() { # shot_settled NAME [SAMPLES]
+    local prev="" cur
+    for _ in $(seq 1 "${2:-60}"); do
+        grim -t ppm "$W/$1.ppm" 2>"$W/grim.err" || { sleep 0.1; continue; }
+        cur=$(md5sum "$W/$1.ppm" | cut -d' ' -f1)
+        [ "$cur" = "$prev" ] && return 0
+        prev="$cur"
+        sleep 0.15
+    done
+}
 close_all
 read -r _ _ _ _ bar_ink < <(px near "$W/bar.ppm" 900 0 "$OUT_W" "$BAR_H" 220 220 220 60)
 
 n1=$(notify cornice-test 0 "" "Short summary" "" "[]" "{}" 0)
 sleep 1.8
-shot short
+shot_settled short
 read -r short_x0 short_y0 short_x1 short_y1 short_count < <(card_region "$W/short.ppm")
 ge 1 "$short_count" "a one-line notification creates a card"
 eq $((OUT_W - 12 - 300)) "$short_x0" "right-anchored card starts at the derived 2*card_gap inset"
@@ -256,7 +280,7 @@ close_all
 
 n2=$(notify cornice-test 0 "" "Long" $'one\ntwo\nthree' "[]" "{}" 0)
 sleep 1.8
-shot long
+shot_settled long
 read -r long_x0 _ long_x1 long_y1 long_count < <(card_region "$W/long.ppm")
 ge 1 "$long_count" "a body grows the same independent card"
 eq "$short_x0" "$long_x0" "short and long cards keep the same fixed-width left edge"
@@ -265,7 +289,7 @@ ge $((short_y1 + 1)) "$long_y1" "multi-line content increases card height"
 
 n3=$(notify cornice-test 0 "" "Second" "also here" "[]" "{}" 0)
 sleep 1.8
-shot two
+shot_settled two
 read -r _ _ _ two_y1 _ < <(card_region "$W/two.ppm")
 ge "$long_y1" "$two_y1" "the second independent card extends the column"
 eq 2 "$(bands two)" "two notifications render as two separate shapes"
@@ -275,7 +299,7 @@ eq 0 "$inter_gap" "independent cards keep one card_gap between them"
 
 n4=$(notify cornice-test 0 "" "Third" "also here" "[]" "{}" 0)
 sleep 1.8
-shot three
+shot_settled three
 read -r _ _ _ three_y1 _ < <(card_region "$W/three.ppm")
 ge "$two_y1" "$three_y1" "a third notification gets its own row"
 eq 3 "$(bands three)" "three notifications render as three separate shapes"
@@ -321,13 +345,13 @@ sec "queue: max_visible cards, then promotion"
 close_all
 notify cornice-test 0 "" "Card 1" "body 1" "[]" "{}" 0 >/dev/null
 sleep 1.8
-shot q1
+shot_settled q1
 read -r _ _ _ q1y _ < <(card_region "$W/q1.ppm")
 eq 1 "$(bands q1)" "one queued notification renders one card"
 
 notify cornice-test 0 "" "Card 2" "body 2" "[]" "{}" 0 >/dev/null
 sleep 1.8
-shot q2
+shot_settled q2
 read -r _ _ _ q2y _ < <(card_region "$W/q2.ppm")
 ge "$q1y" "$q2y" "a second notification extends the independent column"
 eq 2 "$(bands q2)" "both notifications are separate cards"
@@ -338,7 +362,7 @@ for i in 3 4 5 6; do
     sleep 0.15
 done
 sleep 1.8
-shot stack
+shot_settled stack
 read -r _ _ _ stack_y1 _ < <(card_region "$W/stack.ppm")
 ge "$q2y" "$stack_y1" "six queued notifications use the full visible column"
 eq 4 "$(bands stack)" "only max_visible=4 cards are drawn"
@@ -346,14 +370,14 @@ eq 4 "$(bands stack)" "only max_visible=4 cards are drawn"
 newest=$(echo $ids | awk '{print $NF}')
 close_id "$newest"
 sleep 0.8
-shot stack2
+shot_settled stack2
 eq 3 "$(bands stack2)" "closing the newest card leaves three independent cards"
 if closed_pairs | grep -q "^$newest 3$"; then ok "CloseNotification emits reason=3 for $newest"; else bad "no reason=3 for $newest"; fi
 
 oldest=$(echo $ids | awk '{print $1}')
 close_id "$oldest"
 sleep 0.8
-shot stack3
+shot_settled stack3
 eq 4 "$(bands stack3)" "closing a visible card promotes the next queued notification"
 if closed_pairs | grep -q "^$oldest 3$"; then ok "the promoted queue also preserves close reason=3"; else bad "no reason=3 for $oldest"; fi
 close_all
@@ -418,7 +442,6 @@ if closed_pairs | grep -q "^$nc "; then bad "the passthrough click closed the ca
 close_all
 
 sec "idle"
-sleep 1
 cpid=$(pgrep -f "$CORNICE_BIN" | head -1)
 idle_cpu() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null; }
 c0=$(idle_cpu "$cpid")
